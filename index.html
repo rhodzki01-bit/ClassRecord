@@ -1069,6 +1069,7 @@ var CR = (function () {
   }
   function isAdviser(u, sectionId) { return (u.advises || []).indexOf(sectionId) >= 0; }
   function canEdit(u, sectionId, subject) {
+    if (u.admin) return true;
     return u.teaches.some(function (t) { return t.sectionId === sectionId && t.subject === subject; });
   }
   function canView(u, sectionId, subject, settings) {
