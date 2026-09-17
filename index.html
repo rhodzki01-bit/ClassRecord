@@ -2462,7 +2462,7 @@ function rawColsBeforeTotal(row, start, end) {
   for (let c = start; c < end; c++) {
     const v = CR.clean(row[c]);
     if (!v) continue;
-    if (/^total$/i.test(v)) break;
+    if (/^(total|ps|ws)\b/i.test(v)) break; // stop at the first computed column (Total / PS / WS, incl. "WS ST1" etc.)
     cols.push(c);
   }
   return cols;
@@ -2470,7 +2470,10 @@ function rawColsBeforeTotal(row, start, end) {
 function normalizeSubjectLabel(v) {
   return CR.upper(v).replace(/[—–-].*$/, '').replace(/\d+.*$/, '').trim();
 }
-function parseOldTermSheet(rows) {
+/* Format 1: "Learners' Names" and the WW/PT/Summative group labels share one header row,
+   the sub-column numbers sit directly below it, and the Highest Possible Score row follows
+   within the next few rows. Learner names are in column B. */
+function parseOldTermSheetFormat1(rows) {
   let hRow = -1;
   for (let r = 0; r < Math.min(rows.length, 20); r++) {
     const row = rows[r] || [];
@@ -2479,7 +2482,7 @@ function parseOldTermSheet(rows) {
   if (hRow < 0) return null;
   const head = rows[hRow] || [];
   const idxOf = re => head.findIndex(v => re.test(CR.upper(v)));
-  const wwStart = idxOf(/WRITTEN|WORKS|ORAL/), ptStart = idxOf(/PRODUCT|PERFORMANCE/), stStart = idxOf(/SUMMATIVE/);
+  const wwStart = idxOf(/WRITTEN|WORKS|ORAL/), ptStart = idxOf(/PRODUCT|PERFORMANCE/), stStart = idxOf(/SUMMATIVE|EXAM/);
   if (wwStart < 0 || ptStart < 0 || stStart < 0 || !(wwStart < ptStart && ptStart < stStart)) return null;
   let endStart = -1;
   for (let c = stStart + 1; c < head.length; c++) if (/INITIAL GRADE/i.test(CR.upper(head[c]))) { endStart = c; break; }
@@ -2502,6 +2505,7 @@ function parseOldTermSheet(rows) {
   for (let r = hpsRowIdx + 1; r < rows.length; r++) {
     const row = rows[r] || [];
     const nameCell = CR.clean(row[1]);
+    if (SIGNATURE_BLOCK_RE.test(nameCell)) break;
     if (/^MALE\b/i.test(nameCell)) { sex = 'M'; continue; }
     if (/^FEMALE\b/i.test(nameCell)) { sex = 'F'; continue; }
     if (!nameCell || !/[A-Za-zÑñ]/.test(nameCell)) continue;
@@ -2511,6 +2515,92 @@ function parseOldTermSheet(rows) {
   }
   if (!learners.length) return null;
   return { ww, pt, st, sc, learners };
+}
+/* Marks the "Prepared by / Checked by / Noted by …" signature block that follows the roster,
+   so it never gets read as one extra (fake) learner. */
+const SIGNATURE_BLOCK_RE = /^(PREPARED|CHECKED|NOTED|APPROVED|SUBMITTED|VERIFIED)\s*BY\b|^SIGNATURE\b/i;
+
+/* Format 2: the WW/PT/Summative (often labelled "Examinations") group labels sit on their own
+   row, with a blank row before the sub-column numbers; the Highest Possible Score row comes
+   before a separate "Learners' Names" row; learners are numbered in column B with the name in
+   column C; and raw sub-test columns are followed directly by "WS …"/"PS"/"WS" computed
+   columns instead of a "Total" column. */
+function parseOldTermSheetFormat2(rows) {
+  const s = v => CR.clean(v);
+  let groupRow = -1;
+  for (let r = 0; r < Math.min(rows.length, 20); r++) {
+    const row = rows[r] || [];
+    const hasWW = row.some(v => /WRITTEN|WORKS|ORAL/i.test(s(v)));
+    const hasPT = row.some(v => /PRODUCT|PERFORMANCE/i.test(s(v)));
+    const hasNames = row.some(v => /LEARNERS.?\s*NAMES/i.test(s(v)));
+    if (hasWW && hasPT && !hasNames) { groupRow = r; break; }
+  }
+  if (groupRow < 0) return null;
+  const head = rows[groupRow] || [];
+  const idxOf = re => head.findIndex(v => re.test(CR.upper(v)));
+  const wwStart = idxOf(/WRITTEN|WORKS|ORAL/), ptStart = idxOf(/PRODUCT|PERFORMANCE/), stStart = idxOf(/SUMMATIVE|EXAM/);
+  if (wwStart < 0 || ptStart < 0 || stStart < 0 || !(wwStart < ptStart && ptStart < stStart)) return null;
+  let endStart = -1;
+  for (let c = stStart + 1; c < head.length; c++) if (/INITIAL GRADE/i.test(CR.upper(head[c]))) { endStart = c; break; }
+  if (endStart < 0) endStart = head.length;
+
+  let subRow = -1;
+  for (let r = groupRow + 1; r < Math.min(rows.length, groupRow + 6); r++) {
+    const row = rows[r] || [];
+    if (CR.clean(row[wwStart]) && CR.clean(row[ptStart])) { subRow = r; break; }
+  }
+  if (subRow < 0) return null;
+  const sub = rows[subRow] || [];
+  const wwCols = rawColsBeforeTotal(sub, wwStart, ptStart);
+  const ptCols = rawColsBeforeTotal(sub, ptStart, stStart);
+  const stCols = rawColsBeforeTotal(sub, stStart, endStart);
+  if (!wwCols.length || !ptCols.length || !stCols.length) return null;
+
+  let hpsRowIdx = -1;
+  for (let r = subRow + 1; r < Math.min(rows.length, subRow + 6); r++) if (/HIGHEST POSSIBLE SCORE/i.test(CR.clean((rows[r] || [])[1]))) { hpsRowIdx = r; break; }
+  if (hpsRowIdx < 0) return null;
+  const hpsRow = rows[hpsRowIdx];
+  const num0 = v => { const n = CR.num(v); return n === null ? '' : n; };
+  const ww = { hps: wwCols.map(c => num0(hpsRow[c])), desc: [], date: [] };
+  const pt = { hps: ptCols.map(c => num0(hpsRow[c])), desc: [], date: [] };
+  const st = { hps: stCols.map(c => num0(hpsRow[c])), desc: [], date: [] };
+
+  let namesRowIdx = -1;
+  for (let r = hpsRowIdx; r < Math.min(rows.length, hpsRowIdx + 4); r++) {
+    if ((rows[r] || []).some(v => /LEARNERS.?\s*NAMES/i.test(s(v)))) { namesRowIdx = r; break; }
+  }
+  const startScan = namesRowIdx >= 0 ? namesRowIdx + 1 : hpsRowIdx + 1;
+
+  // Learner names are usually in column B, but some layouts number the rows in column B
+  // and put the name in column C instead — detect which one actually holds text.
+  let nameCol = 1;
+  for (let r = startScan; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const v1 = s(row[1]), v2 = s(row[2]);
+    if (/^MALE\b|^FEMALE\b/i.test(v1) || /^MALE\b|^FEMALE\b/i.test(v2)) continue;
+    if (v1 && /[A-Za-zÑñ]/.test(v1) && !/^\d+$/.test(v1)) { nameCol = 1; break; }
+    if (v2 && /[A-Za-zÑñ]/.test(v2) && !/^\d+$/.test(v2) && /^\d*$/.test(v1)) { nameCol = 2; break; }
+  }
+
+  const sc = {}, learners = [];
+  let sex = 'M';
+  for (let r = startScan; r < rows.length; r++) {
+    const row = rows[r] || [];
+    if (SIGNATURE_BLOCK_RE.test(s(row[1])) || SIGNATURE_BLOCK_RE.test(s(row[2]))) break;
+    if (/^MALE\b/i.test(s(row[1])) || /^MALE\b/i.test(s(row[2]))) { sex = 'M'; continue; }
+    if (/^FEMALE\b/i.test(s(row[1])) || /^FEMALE\b/i.test(s(row[2]))) { sex = 'F'; continue; }
+    const nameCell = s(row[nameCol]);
+    if (!nameCell || !/[A-Za-zÑñ]/.test(nameCell)) continue;
+    const key = CR.nameKey(nameCell);
+    sc[key] = { w: wwCols.map(c => num0(row[c])), p: ptCols.map(c => num0(row[c])), s: stCols.map(c => num0(row[c])) };
+    learners.push({ name: nameCell, sex, key });
+  }
+  if (!learners.length) return null;
+  return { ww, pt, st, sc, learners };
+}
+
+function parseOldTermSheet(rows) {
+  return parseOldTermSheetFormat1(rows) || parseOldTermSheetFormat2(rows);
 }
 function parseOldClassRecordWorkbook(wb) {
   const out = { sectionRaw: '', section: null, subject: null, teacher: '', warnings: [], terms: [] };
@@ -2524,7 +2614,12 @@ function parseOldClassRecordWorkbook(wb) {
     const rows = sheetRows(wb.Sheets[name]);
     const parsed = parseOldTermSheet(rows);
     if (!parsed) { out.warnings.push(`Sheet “${name}” looks like a Term ${term} tab but its layout could not be read — it was skipped.`); return; }
-    const secRaw = findLabelValue(rows, /GRADE\s*&?\s*SECTION/i);
+    let secRaw = findLabelValue(rows, /GRADE\s*&?\s*SECTION/i);
+    if (!secRaw) {
+      const gradeRaw = findLabelValue(rows, /^GRADE\s*LEVEL/i);
+      const sectionOnly = findLabelValue(rows, /^SECTION/i);
+      if (gradeRaw && sectionOnly) secRaw = `${gradeRaw} ${sectionOnly}`;
+    }
     const subjRaw = findLabelValue(rows, /^SUBJECT/i);
     const teacherRaw = findLabelValue(rows, /^TEACHER/i);
     if (secRaw && !out.sectionRaw) out.sectionRaw = secRaw;
@@ -2573,7 +2668,7 @@ function drawImportPreview() {
 }
 function viewImportOld() {
   const main = $('#main');
-  main.innerHTML = topbar('Import Old Class Records', 'Upload previously-used Excel class records — this system\u2019s own downloads, or the official DepEd template with the same layout — and their written-works, performance-task and summative-test scores are read straight into the matching class record, term by term.') + `
+  main.innerHTML = topbar('Import Old Class Records', 'Upload previously-used Excel class records — this system\u2019s own downloads, the official DepEd template, or the other common class-record layout (numbered learners in column B, name in column C, an “Examinations” group instead of “Summative Tests”) — and their written-works, performance-task and summative/examination scores are read straight into the matching class record, term by term.') + `
   <div class="wrap">
     <div class="panel"><h3>Upload class record file(s)</h3><div class="panel-body">
       <div class="two"><div><div class="drop" id="importDrop"></div></div>
