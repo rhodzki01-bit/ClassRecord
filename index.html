@@ -699,7 +699,7 @@ var CR = (function () {
     weights: { FIL: [0.2, 0.5, 0.3], ENG: [0.2, 0.5, 0.3], MATH: [0.2, 0.5, 0.3], SCI: [0.2, 0.5, 0.3],
       AP: [0.2, 0.5, 0.3], TLE: [0.2, 0.6, 0.2], MAPEH: [0.2, 0.6, 0.2], VE: [0.2, 0.5, 0.3] },
     stWeights: [0.3, 0.3, 0.4],
-    adminEmails: [],
+    adminEmails: ['301527@deped.gov.ph', 'rhoda.delacruz004@deped.gov.ph'],
     headsViewAll: false,
     googleClientId: ''
   };
@@ -1114,6 +1114,32 @@ var CR = (function () {
     /* ---- administration ---- */
     if (!user.admin) fail('Only the principal or an administrator can do this.', 'forbidden');
 
+    if (action === 'importRecords') {
+      var items = req.records || [];
+      return env.withLock(function () {
+        var results = [];
+        items.forEach(function (it) {
+          var term = Number(it.term);
+          if ([1, 2, 3].indexOf(term) < 0) { results.push({ ok: false, error: 'Unknown term.' }); return; }
+          var part = it.subject === 'MAPEH' ? it.part : 'X';
+          if (it.subject === 'MAPEH' && ['MA', 'PEH'].indexOf(part) < 0) { results.push({ ok: false, error: 'Unknown MAPEH component.' }); return; }
+          var data = sanitizeData(it.data);
+          var id = recordId(it.sectionId, it.subject, part, term);
+          var cur = store.recordMeta().filter(function (r) { return r.id === id; })[0];
+          var w = (dir.settings.weights || {})[it.subject] || DEFAULT_SETTINGS.weights[it.subject];
+          var grades = gradesOf(computePart(data, w, dir.settings.stWeights));
+          var rec = { id: id, sectionId: it.sectionId, subject: it.subject, part: part, term: term,
+            rev: (cur ? Number(cur.rev) : 0) + 1, updatedAt: new Date(env.now()).toISOString(), updatedBy: email,
+            checkedBy: cur ? cur.checkedBy : '', checkedAt: cur ? cur.checkedAt : '',
+            data: data, grades: grades };
+          store.upsertRecord(rec);
+          results.push({ ok: true, id: id, rev: rec.rev, sectionId: it.sectionId, subject: it.subject, part: part, term: term });
+        });
+        log(store, env, email, 'records-imported', results.filter(function (r) { return r.ok; }).length + ' of ' + items.length + ' term records');
+        return { ok: true, results: results };
+      });
+    }
+
     if (action === 'saveDirectory') {
       var d = req.directory || {};
       var asg = (d.assignments || []).map(function (a) {
@@ -1519,6 +1545,7 @@ const NAV = () => {
     items.push({ group: 'SETUP' });
     items.push({ id: 'roster', label: 'Learner Rosters' });
     items.push({ id: 'directory', label: 'Teachers & Checkers' });
+    items.push({ id: 'import', label: 'Import Old Class Records' });
     items.push({ id: 'settings', label: 'Settings & Activity' });
   }
   return items;
@@ -1562,6 +1589,7 @@ async function route() {
     else if (view === 'class') await viewClass(parts[1], parts[2], parts[3]);
     else if (view === 'roster' && S.user.admin) viewRoster();
     else if (view === 'directory' && S.user.admin) viewDirectory();
+    else if (view === 'import' && S.user.admin) viewImportOld();
     else if (view === 'settings' && S.user.admin) await viewSettings();
     else await viewDash();
   } catch (e) {
@@ -2411,6 +2439,167 @@ function parseRosterList(wb) {
   return { sections: out, problems };
 }
 
+/* ------------------------------------------------------------ import old (previously-used) class records
+   Reads a teacher's old Excel class record — either one this system exported earlier, or the official
+   DepEd class record template it mirrors: a REGION/DIVISION/SCHOOL header block, a GRADE & SECTION /
+   TEACHER / SUBJECT line, a WRITTEN WORKS / PRODUCT-PERFORMANCE TASKS / SUMMATIVE TESTS header row,
+   numbered sub-columns, a HIGHEST POSSIBLE SCORE row, then MALE/FEMALE blocks of learners and scores —
+   and turns it into the same {ww,pt,st,sc} shape a teacher typing scores into this site would produce. */
+function findLabelValue(rows, labelRe, maxRow) {
+  const limit = Math.min(rows.length, maxRow || 14);
+  for (let r = 0; r < limit; r++) {
+    const row = rows[r] || [];
+    for (let c = 0; c < row.length; c++) {
+      if (labelRe.test(CR.upper(row[c]))) {
+        for (let k = c + 1; k < row.length && k < c + 8; k++) { const v = CR.clean(row[k]); if (v) return v; }
+      }
+    }
+  }
+  return '';
+}
+function rawColsBeforeTotal(row, start, end) {
+  const cols = [];
+  for (let c = start; c < end; c++) {
+    const v = CR.clean(row[c]);
+    if (!v) continue;
+    if (/^total$/i.test(v)) break;
+    cols.push(c);
+  }
+  return cols;
+}
+function normalizeSubjectLabel(v) {
+  return CR.upper(v).replace(/[—–-].*$/, '').replace(/\d+.*$/, '').trim();
+}
+function parseOldTermSheet(rows) {
+  let hRow = -1;
+  for (let r = 0; r < Math.min(rows.length, 20); r++) {
+    const row = rows[r] || [];
+    if (row.some(v => /LEARNERS.?\s*NAMES/i.test(CR.clean(v))) && row.some(v => /WRITTEN|WORKS|ORAL/i.test(CR.clean(v)))) { hRow = r; break; }
+  }
+  if (hRow < 0) return null;
+  const head = rows[hRow] || [];
+  const idxOf = re => head.findIndex(v => re.test(CR.upper(v)));
+  const wwStart = idxOf(/WRITTEN|WORKS|ORAL/), ptStart = idxOf(/PRODUCT|PERFORMANCE/), stStart = idxOf(/SUMMATIVE/);
+  if (wwStart < 0 || ptStart < 0 || stStart < 0 || !(wwStart < ptStart && ptStart < stStart)) return null;
+  let endStart = -1;
+  for (let c = stStart + 1; c < head.length; c++) if (/INITIAL GRADE/i.test(CR.upper(head[c]))) { endStart = c; break; }
+  if (endStart < 0) endStart = head.length;
+  const sub = rows[hRow + 1] || [];
+  const wwCols = rawColsBeforeTotal(sub, wwStart, ptStart);
+  const ptCols = rawColsBeforeTotal(sub, ptStart, stStart);
+  const stCols = rawColsBeforeTotal(sub, stStart, endStart);
+  if (!wwCols.length || !ptCols.length || !stCols.length) return null;
+  let hpsRowIdx = -1;
+  for (let r = hRow + 1; r < Math.min(rows.length, hRow + 8); r++) if (/HIGHEST POSSIBLE SCORE/i.test(CR.clean((rows[r] || [])[1]))) { hpsRowIdx = r; break; }
+  if (hpsRowIdx < 0) return null;
+  const hpsRow = rows[hpsRowIdx];
+  const num0 = v => { const n = CR.num(v); return n === null ? '' : n; };
+  const ww = { hps: wwCols.map(c => num0(hpsRow[c])), desc: [], date: [] };
+  const pt = { hps: ptCols.map(c => num0(hpsRow[c])), desc: [], date: [] };
+  const st = { hps: stCols.map(c => num0(hpsRow[c])), desc: [], date: [] };
+  const sc = {}, learners = [];
+  let sex = 'M';
+  for (let r = hpsRowIdx + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const nameCell = CR.clean(row[1]);
+    if (/^MALE\b/i.test(nameCell)) { sex = 'M'; continue; }
+    if (/^FEMALE\b/i.test(nameCell)) { sex = 'F'; continue; }
+    if (!nameCell || !/[A-Za-zÑñ]/.test(nameCell)) continue;
+    const key = CR.nameKey(nameCell);
+    sc[key] = { w: wwCols.map(c => num0(row[c])), p: ptCols.map(c => num0(row[c])), s: stCols.map(c => num0(row[c])) };
+    learners.push({ name: nameCell, sex, key });
+  }
+  if (!learners.length) return null;
+  return { ww, pt, st, sc, learners };
+}
+function parseOldClassRecordWorkbook(wb) {
+  const out = { sectionRaw: '', section: null, subject: null, teacher: '', warnings: [], terms: [] };
+  wb.SheetNames.forEach(name => {
+    const nm = name.trim();
+    let term = null, part = 'X', forcedSubject = null, m;
+    if ((m = nm.match(/^MA[_\s]T(?:ERM)?\s*([123])$/i))) { term = +m[1]; part = 'MA'; forcedSubject = 'MAPEH'; }
+    else if ((m = nm.match(/^PEH[_\s]T(?:ERM)?\s*([123])$/i))) { term = +m[1]; part = 'PEH'; forcedSubject = 'MAPEH'; }
+    else if ((m = nm.match(/^T(?:ERM)?\s*([123])$/i))) { term = +m[1]; }
+    if (!term) return;
+    const rows = sheetRows(wb.Sheets[name]);
+    const parsed = parseOldTermSheet(rows);
+    if (!parsed) { out.warnings.push(`Sheet “${name}” looks like a Term ${term} tab but its layout could not be read — it was skipped.`); return; }
+    const secRaw = findLabelValue(rows, /GRADE\s*&?\s*SECTION/i);
+    const subjRaw = findLabelValue(rows, /^SUBJECT/i);
+    const teacherRaw = findLabelValue(rows, /^TEACHER/i);
+    if (secRaw && !out.sectionRaw) out.sectionRaw = secRaw;
+    if (teacherRaw && !out.teacher) out.teacher = teacherRaw;
+    const subjCode = forcedSubject || CR.subjectCode(normalizeSubjectLabel(subjRaw));
+    if (!out.subject && subjCode) out.subject = subjCode;
+    out.terms.push({ term, part, data: { ww: parsed.ww, pt: parsed.pt, st: parsed.st, sc: parsed.sc }, learners: parsed.learners });
+  });
+  if (out.sectionRaw) out.section = CR.parseSection(out.sectionRaw);
+  return out;
+}
+
+let importPending = [];
+async function addImportFile(file) {
+  try {
+    const wb = await readWorkbook(file);
+    const parsed = parseOldClassRecordWorkbook(wb);
+    if (!parsed.terms.length) throw new Error('No TERM1/TERM2/TERM3 (or MA_T#/PEH_T# for MAPEH) tabs with a readable class-record layout were found.');
+    if (!parsed.section) throw new Error('Could not read the “GRADE & SECTION” for this file.');
+    if (!parsed.subject) throw new Error('Could not tell which learning area this file is for — check the “SUBJECT” line.');
+    importPending.push({ file: file.name, section: parsed.section, subject: parsed.subject, teacher: parsed.teacher, terms: parsed.terms, warnings: parsed.warnings });
+  } catch (e) { importPending.push({ file: file.name, error: e.message }); }
+  drawImportPreview();
+}
+function drawImportPreview() {
+  const box = $('#importPreview');
+  if (!box) return;
+  if (!importPending.length) { box.innerHTML = ''; return; }
+  const rows = importPending.map(it => {
+    if (it.error) return `<tr><td>${esc(it.file)}</td><td colspan="5"><span class="pill bad">${esc(it.error)}</span></td></tr>`;
+    const known = S.sectionMap[it.section.id];
+    const termLbl = it.terms.map(t => 'T' + t.term + (t.part !== 'X' ? ' ' + t.part : '')).join(', ');
+    const learners = Math.max(...it.terms.map(t => t.learners.length));
+    return `<tr><td>${esc(it.file)}</td><td>${esc(it.section.label)}${known ? '' : ' <span class="pill bad" title="Not among your current sections — the roster and teacher assignment can be uploaded before or after this import.">new</span>'}</td>
+      <td>${esc(subjLabel(it.subject))}</td><td>${esc(it.teacher || '—')}</td><td>${esc(termLbl)}</td><td class="num">${learners}</td></tr>`;
+  }).join('');
+  const ready = importPending.filter(it => !it.error);
+  const nTerms = ready.reduce((a, it) => a + it.terms.length, 0);
+  const warn = [].concat(...ready.map(it => it.warnings || []));
+  box.innerHTML = `<h4 style="margin:18px 0 8px">Files added</h4>
+    ${warn.length ? `<div class="note">${warn.map(esc).join('<br>')}</div>` : ''}
+    <table class="grid tight"><thead><tr><th>File</th><th>Section</th><th>Subject</th><th>Teacher</th><th>Terms</th><th class="num">Learners</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <p><button class="btn" id="doImport"${nTerms ? '' : ' disabled'}>Import ${nTerms} term record${nTerms === 1 ? '' : 's'} from ${ready.length} file${ready.length === 1 ? '' : 's'}</button>
+    <button class="btn ghost sm" id="clearImport">Clear</button></p>`;
+}
+function viewImportOld() {
+  const main = $('#main');
+  main.innerHTML = topbar('Import Old Class Records', 'Upload previously-used Excel class records — this system\u2019s own downloads, or the official DepEd template with the same layout — and their written-works, performance-task and summative-test scores are read straight into the matching class record, term by term.') + `
+  <div class="wrap">
+    <div class="panel"><h3>Upload class record file(s)</h3><div class="panel-body">
+      <div class="two"><div><div class="drop" id="importDrop"></div></div>
+      <div class="hint" style="margin:0">
+        <p style="margin-top:0">Each workbook should have:</p>
+        <ul class="complist">
+          <li>A <b>GRADE &amp; SECTION</b>, <b>TEACHER</b> and <b>SUBJECT</b> line near the top of each term tab.</li>
+          <li>Tabs named <b>TERM1</b>, <b>TERM2</b>, <b>TERM3</b> — or, for MAPEH, <b>MA_T1</b>/<b>PEH_T1</b> and so on.</li>
+          <li>The usual WRITTEN WORKS / PERFORMANCE TASKS / SUMMATIVE TESTS columns, a HIGHEST POSSIBLE SCORE row, and MALE / FEMALE learner blocks.</li>
+        </ul>
+        <p>You can drop several files at once — one workbook per class. Only <b>${esc('301527@deped.gov.ph')}</b> and <b>${esc('rhoda.delacruz004@deped.gov.ph')}</b> (or any other administrator) can do this. Importing again for the same section, subject and term replaces that term's scores.</p></div></div>
+      <div id="importPreview"></div>
+    </div></div>
+  </div>`;
+  importPending = [];
+  const el = document.getElementById('importDrop');
+  el.innerHTML = `<div class="big">Drop old class record files here</div><div class="small">or click to choose one or more .xlsx files</div><input type="file" accept=".xlsx,.xls" multiple hidden>`;
+  const input = el.querySelector('input');
+  const handleFiles = files => { [...files].forEach(f => addImportFile(f)); };
+  el.onclick = () => input.click();
+  input.onchange = () => input.files.length && handleFiles(input.files);
+  el.ondragover = e => { e.preventDefault(); el.classList.add('over'); };
+  el.ondragleave = () => el.classList.remove('over');
+  el.ondrop = e => { e.preventDefault(); el.classList.remove('over'); e.dataTransfer.files.length && handleFiles(e.dataTransfer.files); };
+}
+
 /* ------------------------------------------------------------ roster view */
 let rosterPending = null;
 function viewRoster() {
@@ -2649,6 +2838,22 @@ document.addEventListener('click', async e => {
         toast(msg);
         renderNav('directory');
         viewDirectory();
+      } catch (err) { toast(err.message, true); busy(t, false); }
+      return;
+    }
+    case 'clearImport': importPending = []; drawImportPreview(); return;
+    case 'doImport': {
+      busy(t, true, 'Importing…');
+      try {
+        const ready = importPending.filter(it => !it.error);
+        const records = [];
+        ready.forEach(it => it.terms.forEach(tm => records.push({ sectionId: it.section.id, subject: it.subject, part: tm.part, term: tm.term, data: tm.data })));
+        if (!records.length) { toast('Nothing to import.', true); busy(t, false); return; }
+        const r = await api('importRecords', { records });
+        const ok = r.results.filter(x => x.ok).length;
+        await loadAll();
+        toast(`Imported ${ok} of ${records.length} term record${records.length === 1 ? '' : 's'}.`);
+        viewImportOld();
       } catch (err) { toast(err.message, true); busy(t, false); }
       return;
     }
