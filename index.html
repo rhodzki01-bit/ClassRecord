@@ -780,7 +780,8 @@ var CR = (function () {
     stWeights: [0.3, 0.3, 0.4],
     adminEmails: ['301527@deped.gov.ph', 'rhoda.delacruz004@deped.gov.ph'],
     headsViewAll: false,
-    googleClientId: ''
+    googleClientId: '',
+    portalUrl: ''
   };
 
   /* New transmutation table ('Helper (Do Not Delete)'!H3:K43): lower bound -> grade */
@@ -1082,6 +1083,36 @@ var CR = (function () {
   }
   function canViewAny(u) { return u.admin || !!u.head || (u.advises || []).length > 0; }
 
+  /* ---- student portal accounts -------------------------------------------
+     Learners sign in to the Proficiency Portal with their LRN (or the QR code
+     on their school ID) and a 6-digit PIN they choose themselves. Only the
+     salted hash of that PIN is ever stored, so a reset issues a new temporary
+     PIN rather than revealing the old one. The class adviser manages the
+     accounts for their own section; the principal and administrators, any. */
+  function boolish(v) { return v === true || v === 'true' || v === 'TRUE' || v === 1 || v === '1'; }
+  function randomPin() { return String(Math.floor(100000 + Math.random() * 900000)); }
+  function publicStudent(s, now) {
+    var locked = s.lockedUntil ? (new Date(s.lockedUntil).getTime() > now) : false;
+    return { lrn: String(s.lrn || ''), sectionId: s.sectionId, name: s.name,
+      issued: !!s.hash, activated: !!s.hash && !boolish(s.mustChange),
+      locked: locked, lockedUntil: locked ? s.lockedUntil : '',
+      lastLogin: s.lastLogin || '', qr: !!s.qrToken,
+      target2: s.t2target || '', target3: s.t3target || '' };
+  }
+  function canManageStudents(u, sectionId) {
+    if (u.admin || u.principal) return true;
+    if (!sectionId) return false;
+    return isAdviser(u, sectionId);
+  }
+  function manageableSections(u, dir) {
+    if (u.admin || u.principal) {
+      var seen = {}, out = [];
+      dir.assignments.forEach(function (a) { if (!seen[a.sectionId]) { seen[a.sectionId] = 1; out.push(a.sectionId); } });
+      return out;
+    }
+    return (u.advises || []).slice();
+  }
+
   function publicUser(u) {
     return { email: u.email, name: u.name, admin: u.admin, principal: u.principal, head: u.head,
       role: u.role || '', teaches: u.teaches, advises: u.advises || [] };
@@ -1308,6 +1339,69 @@ var CR = (function () {
       });
     }
 
+    /* ---- student portal accounts ---- */
+    if (action === 'studentAccounts') {
+      var aSids = manageableSections(user, dir);
+      if (req.sectionId) {
+        if (!canManageStudents(user, req.sectionId)) fail('Only the class adviser or an administrator can see the portal accounts of this section.', 'forbidden');
+        aSids = [req.sectionId];
+      }
+      var aPick = {};
+      aSids.forEach(function (s) { aPick[s] = true; });
+      var aNow = env.now();
+      return { ok: true, sections: aSids, portalUrl: dir.settings.portalUrl || '',
+        accounts: store.read('students').filter(function (s) { return aPick[s.sectionId]; })
+          .map(function (s) { return publicStudent(s, aNow); }) };
+    }
+
+    if (action === 'issuePins') {
+      var iSid = req.sectionId;
+      if (!canManageStudents(user, iSid)) fail('Only the class adviser or an administrator can issue student PINs.', 'forbidden');
+      return env.withLock(function () {
+        var rows = store.read('students');
+        var byLrn = {}, byToken = {};
+        rows.forEach(function (s, i) { byLrn[String(s.lrn)] = i; if (s.qrToken) byToken[String(s.qrToken)] = 1; });
+        var only = null;
+        if (req.lrns && req.lrns.length) { only = {}; req.lrns.forEach(function (x) { only[clean(x)] = 1; }); }
+        var issued = [], skipped = [];
+        store.read('learners').forEach(function (l) {
+          if (l.sectionId !== iSid) return;
+          var lrn = clean(l.lrn);
+          if (only && !only[lrn]) return;
+          if (!lrn) { skipped.push({ name: l.name, reason: 'No LRN on the roster' }); return; }
+          var at = byLrn[lrn];
+          var was = at === undefined ? null : rows[at];
+          if (was && was.hash && !req.reissue) { skipped.push({ name: l.name, reason: 'Already has an account' }); return; }
+          var pin = randomPin(), salt = env.randomToken(), token = was && was.qrToken ? String(was.qrToken) : '';
+          while (!token) { var t = env.randomToken().replace(/-/g, '').slice(0, 20); if (!byToken[t]) { token = t; byToken[t] = 1; } }
+          var rec = { lrn: lrn, sectionId: iSid, key: l.key, name: l.name, qrToken: token,
+            hash: env.sha256(pin + salt), salt: salt, mustChange: 'true', fails: '0', lockedUntil: '', lastLogin: '',
+            t2target: was ? (was.t2target || '') : '', t3target: was ? (was.t3target || '') : '' };
+          if (at === undefined) { byLrn[lrn] = rows.length; rows.push(rec); } else rows[at] = rec;
+          issued.push({ lrn: lrn, name: l.name, pin: pin, qrToken: token });
+        });
+        if (issued.length) store.write('students', rows);
+        log(store, env, email, req.reissue ? 'student-pins-reset' : 'student-pins-issued',
+          iSid + ' \u00b7 ' + issued.length + ' account' + (issued.length === 1 ? '' : 's'));
+        return { ok: true, issued: issued, skipped: skipped };
+      });
+    }
+
+    if (action === 'studentUnlock') {
+      if (!canManageStudents(user, req.sectionId)) fail('Only the class adviser or an administrator can do this.', 'forbidden');
+      return env.withLock(function () {
+        var rows = store.read('students'), want = {}, n = 0;
+        (req.lrns || []).forEach(function (x) { want[clean(x)] = 1; });
+        rows.forEach(function (s) {
+          if (s.sectionId !== req.sectionId || !want[String(s.lrn)]) return;
+          s.fails = '0'; s.lockedUntil = ''; n++;
+        });
+        if (n) store.write('students', rows);
+        log(store, env, email, 'student-unlocked', req.sectionId + ' \u00b7 ' + n);
+        return { ok: true, unlocked: n };
+      });
+    }
+
     /* ---- administration ---- */
     if (!user.admin) fail('Only the principal or an administrator can do this.', 'forbidden');
 
@@ -1363,7 +1457,7 @@ var CR = (function () {
 
     if (action === 'saveSettings') {
       var allowed = ['schoolFull', 'schoolName', 'schoolId', 'region', 'division', 'schoolYear', 'order', 'principal',
-        'weights', 'stWeights', 'adminEmails', 'headsViewAll', 'googleClientId'];
+        'weights', 'stWeights', 'adminEmails', 'headsViewAll', 'googleClientId', 'portalUrl'];
       var patch = {};
       allowed.forEach(function (k) { if (req.settings && req.settings[k] !== undefined) patch[k] = req.settings[k]; });
       if (patch.adminEmails) patch.adminEmails = patch.adminEmails.map(normEmail).filter(validEmail);
@@ -1426,6 +1520,7 @@ var CR = (function () {
     r2: r2, r0: r0, num: num, transmute: transmute, band: band, descriptor: descriptor, emptyPart: emptyPart,
     computePart: computePart, gradesOf: gradesOf, avgRound: avgRound, counts: counts,
     resolveUser: resolveUser, canEdit: canEdit, canView: canView, canViewAny: canViewAny, isAdviser: isAdviser,
+    canManageStudents: canManageStudents, manageableSections: manageableSections, boolish: boolish,
     recordId: recordId, handle: handle, sanitizeData: sanitizeData
   };
 })();
@@ -1456,6 +1551,7 @@ var TABLES = {
   assignments: ['sectionId', 'section', 'grade', 'sectionName', 'adviser', 'adviserEmail', 'subject', 'teacher', 'email'],
   checkers: ['name', 'role', 'email', 'subjects'],
   learners: ['sectionId', 'order', 'sex', 'name', 'key', 'lrn'],
+  students: ['lrn', 'sectionId', 'key', 'name', 'qrToken', 'hash', 'salt', 'mustChange', 'fails', 'lockedUntil', 'lastLogin', 't2target', 't3target'],
   sessions: ['hash', 'email', 'expires'],
   log: ['time', 'email', 'action', 'detail'],
   records: ['id', 'sectionId', 'subject', 'part', 'term', 'rev', 'updatedAt', 'updatedBy', 'checkedBy', 'checkedAt', 'grades', 'data0', 'data1', 'data2', 'data3', 'data4', 'data5']
@@ -1624,6 +1720,2415 @@ function setup() {
   Object.keys(TABLES).forEach(sheet_);
   Logger.log('Ready. Owner: ' + Env.ownerEmail);
 }
+</script>
+<script type="text/plain" id="portalCodeSrc">
+/* ====================================================================
+   CANHS Proficiency Level and Class Records — shared core
+   The same code runs inside Google Apps Script (the school server) and
+   inside the browser's demo mode, so grade computation and permission
+   rules can never drift apart between the two.
+   ==================================================================== */
+var CR = (function () {
+  'use strict';
+
+  var SUBJECTS = [
+    { code: 'FIL', name: 'FILIPINO', label: 'Filipino', keys: ['FILIPINO'] },
+    { code: 'ENG', name: 'ENGLISH', label: 'English', keys: ['ENGLISH'] },
+    { code: 'MATH', name: 'MATHEMATICS', label: 'Mathematics', keys: ['MATHEMATICS', 'MATH'] },
+    { code: 'SCI', name: 'SCIENCE', label: 'Science', keys: ['SCIENCE'] },
+    { code: 'AP', name: 'ARALING PANLIPUNAN', label: 'Araling Panlipunan', keys: ['ARALING PANLIPUNAN', 'AP', 'ARAL'] },
+    { code: 'TLE', name: 'TLE', label: 'TLE', keys: ['TLE'] },
+    { code: 'MAPEH', name: 'MAPEH', label: 'MAPEH', keys: ['MAPEH'] },
+    { code: 'VE', name: 'VALUES EDUCATION', label: 'Values Education', keys: ['VALUES EDUCATION', 'VALUES ED', 'VALUES', 'EDUKASYON SA PAGPAPAKATAO', 'ESP'] }
+  ];
+  var SUBJ = {};
+  SUBJECTS.forEach(function (s) { SUBJ[s.code] = s; });
+
+  var DEFAULT_SETTINGS = {
+    schoolFull: 'Castor Alviar National High School',
+    schoolName: 'CASTOR ALVIAR NHS',
+    schoolId: '301527',
+    region: 'IV-A',
+    division: 'CALAMBA CITY',
+    schoolYear: '2026-2027',
+    order: 'DepEd Order No. 15, s. 2026',
+    principal: 'RHODA O. DELA CRUZ',
+    weights: { FIL: [0.2, 0.5, 0.3], ENG: [0.2, 0.5, 0.3], MATH: [0.2, 0.5, 0.3], SCI: [0.2, 0.5, 0.3],
+      AP: [0.2, 0.5, 0.3], TLE: [0.2, 0.6, 0.2], MAPEH: [0.2, 0.6, 0.2], VE: [0.2, 0.5, 0.3] },
+    stWeights: [0.3, 0.3, 0.4],
+    adminEmails: ['301527@deped.gov.ph', 'rhoda.delacruz004@deped.gov.ph'],
+    headsViewAll: false,
+    googleClientId: '',
+    portalUrl: ''
+  };
+
+  /* New transmutation table ('Helper (Do Not Delete)'!H3:K43): lower bound -> grade */
+  var TRANSMU = [[0, 60], [4.68, 61], [9.35, 62], [14.01, 63], [18.68, 64], [23.35, 65], [28.01, 66], [32.68, 67],
+    [37.34, 68], [42.01, 69], [46.67, 70], [51.34, 71], [56.01, 72], [60.67, 73], [65.34, 74], [70, 75],
+    [71.18, 76], [72.36, 77], [73.54, 78], [74.72, 79], [75.9, 80], [77.08, 81], [78.26, 82], [79.44, 83],
+    [80.62, 84], [81.8, 85], [82.98, 86], [84.16, 87], [85.34, 88], [86.52, 89], [87.7, 90], [88.88, 91],
+    [90.06, 92], [91.24, 93], [92.42, 94], [93.6, 95], [94.78, 96], [95.96, 97], [97.14, 98], [98.32, 99], [99.5, 100]];
+
+  var SCALE = [ // school descriptors (DESCRIPTORS range)
+    { min: 90, label: 'Advancing', range: '90-100' },
+    { min: 80, label: 'Benchmarking', range: '80-89' },
+    { min: 75, label: 'Connecting', range: '75-79' },
+    { min: 65, label: 'Developing', range: '65-74' },
+    { min: 0, label: 'Emerging', range: '0-64' }
+  ];
+  var DEPED = [
+    { min: 90, label: 'Outstanding', range: '90-100' },
+    { min: 85, label: 'Very Satisfactory', range: '85-89' },
+    { min: 80, label: 'Satisfactory', range: '80-84' },
+    { min: 75, label: 'Fairly Satisfactory', range: '75-79' },
+    { min: 0, label: 'Did not meet expectations', range: '0-74' }
+  ];
+
+  /* ------------------------------------------------------------ text */
+  function clean(s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); }
+  function upper(s) { return clean(s).toUpperCase(); }
+  function nameKey(s) { return upper(s).replace(/[.,]/g, ' ').replace(/Ñ/g, 'N').replace(/\s+/g, ' ').trim(); }
+  function normEmail(s) {
+    return clean(s).toLowerCase().replace(/,/g, '.').replace(/\s/g, '');
+  }
+  function validEmail(s) { return /^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(s); }
+  function subjectCode(s) {
+    var u = upper(s);
+    for (var i = 0; i < SUBJECTS.length; i++) {
+      if (SUBJECTS[i].code === u) return SUBJECTS[i].code;
+      for (var j = 0; j < SUBJECTS[i].keys.length; j++) if (u === SUBJECTS[i].keys[j]) return SUBJECTS[i].code;
+    }
+    return null;
+  }
+  function sectionId(label) { var p = parseSection(label); return p ? p.id : null; }
+  function parseSection(label) {
+    var m = upper(label).match(/^(?:GRADE\s*)?(\d{1,2})\s*[-–]?\s*(.+)$/);
+    if (!m) return null;
+    return { id: m[1] + '-' + m[2].replace(/\s+/g, ' '), grade: +m[1], name: m[2], label: m[1] + ' - ' + m[2] };
+  }
+  /* "DELA CRUZ, RHODA O." -> "RHODA O. DELA CRUZ" */
+  function displayName(s) {
+    s = clean(s);
+    if (s.indexOf(',') > 0) {
+      var p = s.split(',');
+      return upper(clean(p.slice(1).join(' ')) + ' ' + clean(p[0]));
+    }
+    return upper(s);
+  }
+  function headSubjects(role) {
+    var r = upper(role);
+    if (/PRINCIPAL/.test(r) && !/ASSISTANT/.test(r)) return null; // everything
+    var out = [];
+    if (/MATH/.test(r)) out.push('MATH');
+    if (/\bTLE\b|TECHNOLOGY/.test(r)) out.push('TLE');
+    if (/SCIENCE/.test(r)) out.push('SCI');
+    if (/MAPEH/.test(r)) out.push('MAPEH');
+    if (/FILIPINO/.test(r)) out.push('FIL');
+    if (/ENGLISH/.test(r)) out.push('ENG');
+    if (/\bAP\b|ARALING/.test(r)) out.push('AP');
+    if (/VALUES|ESP|EDUKASYON/.test(r)) out.push('VE');
+    return out;
+  }
+
+  /* ------------------------------------------------------------ grades */
+  function r2(x) { return Math.round((x + (x >= 0 ? 1e-9 : -1e-9)) * 100) / 100; }
+  function r0(x) { return Math.round(x + (x >= 0 ? 1e-9 : -1e-9)); }
+  function num(v) {
+    if (v === '' || v === null || v === undefined) return null;
+    var n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+  function transmute(ig) {
+    if (ig === null || ig === undefined) return null;
+    var g = null;
+    for (var i = 0; i < TRANSMU.length; i++) { if (ig >= TRANSMU[i][0] - 1e-9) g = TRANSMU[i][1]; else break; }
+    return g;
+  }
+  function band(table, g) {
+    if (g === null || g === undefined) return null;
+    for (var i = 0; i < table.length; i++) if (g >= table[i].min) return table[i];
+    return table[table.length - 1];
+  }
+  function descriptor(g) { var b = band(SCALE, g); return b ? b.label : ''; }
+
+  function emptyPart() {
+    return { ww: { hps: ['', '', '', '', ''], desc: [], date: [] },
+      pt: { hps: ['', '', ''], desc: [], date: [] },
+      st: { hps: ['', '', ''], desc: [], date: [] },
+      sc: {} };
+  }
+
+  /* One term of one class record (or one MAPEH component), exactly as the
+     TERM sheet formulas compute it. Returns a row per learner key. */
+  function validW(w) {
+    if (!w || w.length !== 3) return false;
+    var t = 0;
+    for (var i = 0; i < 3; i++) { var n = num(w[i]); if (n === null || n < 0) return false; t += n; }
+    return Math.abs(t - 1) < 0.0005;
+  }
+
+  /* A class record imported from a teacher's own workbook keeps that workbook's
+     computation rules in data.calc, so the grades here equal the grades there:
+       w      component weights [WW, PT, ST]
+       st     'weighted' (WS ST1 + WS ST2 + WS TE) or 'sum' (total over total HPS)
+       stW    weights inside the summative component (weighted mode)
+       round  true when the workbook rounds PS / WS / initial grade to 2 decimals
+       ig     'any' (initial grade once any score exists), 'all' (needs all three
+              components) or 'te' (needs the term examination score) */
+  function computeCalc(data, weights, stW) {
+    var c = data.calc || {};
+    var w = validW(c.w) ? c.w.map(Number) : weights;
+    var sw = validW(c.stW) ? c.stW.map(Number) : stW;
+    var R = c.round === false ? function (x) { return x; } : r2;
+    var hpsSum = function (arr) {
+      var t = 0, n = 0;
+      (arr || []).forEach(function (v) { var x = num(v); if (x !== null) { t += x; n++; } });
+      return n ? t : null;
+    };
+    var wwH = hpsSum(data.ww.hps), ptH = hpsSum(data.pt.hps), stH = hpsSum(data.st.hps);
+    var sh = [0, 1, 2].map(function (i) { return num((data.st.hps || [])[i]); });
+    var out = {};
+    Object.keys(data.sc || {}).forEach(function (k) {
+      var row = data.sc[k] || {};
+      var res = { ww: null, wwPS: null, wwWS: null, pt: null, ptPS: null, ptWS: null,
+        st: null, stPS: null, stWS: null, initial: null, grade: null };
+      var tot = function (arr, n) {
+        var t = 0, cnt = 0;
+        for (var i = 0; i < n; i++) { var v = num((arr || [])[i]); if (v !== null) { t += v; cnt++; } }
+        return cnt ? t : null;
+      };
+      res.ww = tot(row.w, (data.ww.hps || []).length);
+      if (res.ww !== null && wwH) { res.wwPS = R(res.ww / wwH * 100); res.wwWS = R(res.wwPS * w[0]); }
+      res.pt = tot(row.p, (data.pt.hps || []).length);
+      if (res.pt !== null && ptH) { res.ptPS = R(res.pt / ptH * 100); res.ptWS = R(res.ptPS * w[1]); }
+      var s = [0, 1, 2].map(function (i) { return num((row.s || [])[i]); });
+      var cnt = s.filter(function (v) { return v !== null; }).length;
+      if (cnt > 0) {
+        if (c.st === 'sum') {
+          res.st = s[0] + s[1] + s[2];
+          if (stH) { res.stPS = R(res.st / stH * 100); res.stWS = R(res.stPS * w[2]); }
+        } else {
+          var t = 0, pts = sw.map(function (x) { return Math.round(x * 1e6) / 1e4; });
+          for (var i = 0; i < 3; i++) if (s[i] !== null && sh[i]) t += R(s[i] / sh[i] * pts[i]);
+          res.st = t; res.stPS = t; res.stWS = R(t * w[2]);
+        }
+      }
+      var ig = c.ig || 'te';
+      var ready = ig === 'any' ? (res.wwWS !== null || res.ptWS !== null || res.stWS !== null)
+        : ig === 'all' ? (res.wwWS !== null && res.ptWS !== null && res.stWS !== null)
+        : (s[2] !== null);
+      if (ready) {
+        res.initial = R((res.wwWS || 0) + (res.ptWS || 0) + (res.stWS || 0));
+        res.grade = transmute(c.round === false ? res.initial : r2(res.initial));
+      }
+      out[k] = res;
+    });
+    return out;
+  }
+
+  function computePart(data, weights, stW) {
+    data = data || emptyPart();
+    weights = weights || [0.2, 0.5, 0.3];
+    stW = stW || [0.3, 0.3, 0.4];
+    if (data.calc) return computeCalc(data, weights, stW);
+    var sumHps = function (arr) {
+      var t = 0, c = 0;
+      (arr || []).forEach(function (v) { var n = num(v); if (n !== null) { t += n; c++; } });
+      return c ? t : null;
+    };
+    var wwH = sumHps(data.ww.hps), ptH = sumHps(data.pt.hps);
+    var stH = (data.st.hps || []).map(num);
+    var out = {};
+    var sc = data.sc || {};
+    Object.keys(sc).forEach(function (k) {
+      var row = sc[k] || {};
+      var res = { ww: null, wwPS: null, wwWS: null, pt: null, ptPS: null, ptWS: null,
+        st: null, stPS: null, stWS: null, initial: null, grade: null };
+      var tot = function (arr, n) {
+        var t = 0, c = 0;
+        for (var i = 0; i < n; i++) { var v = num((arr || [])[i]); if (v !== null) { t += v; c++; } }
+        return c ? t : null;
+      };
+      res.ww = tot(row.w, (data.ww.hps || []).length);
+      if (res.ww !== null && wwH) { res.wwPS = r2(res.ww / wwH * 100); res.wwWS = r2(res.wwPS * weights[0]); }
+      res.pt = tot(row.p, (data.pt.hps || []).length);
+      if (res.pt !== null && ptH) { res.ptPS = r2(res.pt / ptH * 100); res.ptWS = r2(res.ptPS * weights[1]); }
+      var s = (row.s || []).map(num);
+      var cnt = s.filter(function (v) { return v !== null; }).length;
+      if (cnt > 0 && stH[0] && stH[1] && stH[2]) {
+        res.st = ((s[0] || 0) / stH[0] * 100 * stW[0]) + ((s[1] || 0) / stH[1] * 100 * stW[1]) + ((s[2] || 0) / stH[2] * 100 * stW[2]);
+        res.stPS = res.st;
+        res.stWS = r2(res.stPS * weights[2]);
+      }
+      if (s[2] !== null && s[2] !== undefined) {
+        res.initial = r2((res.wwWS || 0) + (res.ptWS || 0) + (res.stWS || 0));
+        res.grade = transmute(res.initial);
+      }
+      out[k] = res;
+    });
+    return out;
+  }
+
+  function gradesOf(computed) {
+    var g = {};
+    Object.keys(computed).forEach(function (k) { if (computed[k].grade !== null) g[k] = computed[k].grade; });
+    return g;
+  }
+  function avgRound(list) {
+    for (var i = 0; i < list.length; i++) if (list[i] === null || list[i] === undefined) return null;
+    var t = 0; list.forEach(function (v) { t += v; });
+    return r0(t / list.length);
+  }
+  function counts(grades, table) {
+    var c = table.map(function () { return 0; });
+    grades.forEach(function (g) {
+      if (g === null || g === undefined) return;
+      for (var i = 0; i < table.length; i++) if (g >= table[i].min) { c[i]++; break; }
+    });
+    return c;
+  }
+
+  /* ------------------------------------------------------------ directory */
+  function readDirectory(store) {
+    var settings = Object.assign({}, DEFAULT_SETTINGS);
+    store.read('settings').forEach(function (r) {
+      try { settings[r.key] = JSON.parse(r.value); } catch (e) { settings[r.key] = r.value; }
+    });
+    return {
+      settings: settings,
+      teachers: store.read('teachers'),
+      assignments: store.read('assignments'),
+      checkers: store.read('checkers')
+    };
+  }
+
+  function resolveUser(email, dir, env) {
+    email = normEmail(email);
+    var u = { email: email, name: '', admin: false, principal: false, head: null, teaches: [], advises: [] };
+    if (env && env.ownerEmail && normEmail(env.ownerEmail) === email) u.admin = true;
+    (dir.settings.adminEmails || []).forEach(function (e) { if (normEmail(e) === email) u.admin = true; });
+    dir.checkers.forEach(function (c) {
+      if (normEmail(c.email) !== email) return;
+      u.name = u.name || displayName(c.name);
+      var subs = c.subjects ? String(c.subjects).split(',').filter(Boolean) : [];
+      if (!c.subjects || c.subjects === '*') { u.principal = true; u.admin = true; u.head = '*'; u.role = c.role; }
+      else if (c.subjects === 'ALL') { u.head = '*'; u.role = u.role || c.role; }
+      else { u.head = (u.head === '*') ? '*' : (u.head || []).concat(subs); u.role = u.role || c.role; }
+    });
+    dir.assignments.forEach(function (a) {
+      if (a.email && normEmail(a.email) === email) {
+        u.teaches.push({ sectionId: a.sectionId, subject: a.subject });
+        u.name = u.name || a.teacher;
+      }
+    });
+    dir.teachers.forEach(function (t) { if (!u.name && normEmail(t.email) === email) u.name = t.name; });
+    /* advisers: the email saved with the section, or the email of the teacher with the adviser's name */
+    var myNames = dir.teachers.filter(function (t) { return normEmail(t.email) === email; }).map(function (t) { return sameNameKey(t.name); });
+    var advSeen = {};
+    dir.assignments.forEach(function (a) {
+      if (advSeen[a.sectionId]) return;
+      var mine = a.adviserEmail ? normEmail(a.adviserEmail) === email : (a.adviser && myNames.some(function (n) { return sameName(n, sameNameKey(a.adviser)); }));
+      if (mine) { advSeen[a.sectionId] = true; u.advises.push(a.sectionId); }
+    });
+    u.known = u.admin || !!u.head || u.teaches.length > 0 || u.advises.length > 0;
+    if (!u.name) u.name = email;
+    return u;
+  }
+
+  function sameNameKey(s) {
+    return upper(s).replace(/\b(MR|MRS|MS|DR)\./g, ' ').replace(/[^A-ZÑ\s]/g, ' ').split(/\s+/).filter(function (t) { return t.length > 1; }).sort().join(' ');
+  }
+  /* two name keys (sorted words, initials dropped) name the same person when every word of the shorter is in the longer */
+  function sameName(a, b) {
+    if (!a || !b) return false;
+    if (a === b) return true;
+    var x = a.split(' '), y = b.split(' ');
+    var sh = x.length <= y.length ? x : y, lo = sh === x ? y : x;
+    return sh.length >= 2 && sh.every(function (t) { return lo.indexOf(t) >= 0; });
+  }
+  function isAdviser(u, sectionId) { return (u.advises || []).indexOf(sectionId) >= 0; }
+  function canEdit(u, sectionId, subject) {
+    if (u.admin) return true;
+    return u.teaches.some(function (t) { return t.sectionId === sectionId && t.subject === subject; });
+  }
+  function canView(u, sectionId, subject, settings) {
+    if (u.admin || u.principal || u.head === '*') return true;
+    if (canEdit(u, sectionId, subject)) return true;
+    if (isAdviser(u, sectionId)) return true;
+    if (u.head && (settings && settings.headsViewAll)) return true;
+    if (u.head && u.head.indexOf(subject) >= 0) return true;
+    return false;
+  }
+  function canViewAny(u) { return u.admin || !!u.head || (u.advises || []).length > 0; }
+
+  /* ---- student portal accounts -------------------------------------------
+     Learners sign in to the Proficiency Portal with their LRN (or the QR code
+     on their school ID) and a 6-digit PIN they choose themselves. Only the
+     salted hash of that PIN is ever stored, so a reset issues a new temporary
+     PIN rather than revealing the old one. The class adviser manages the
+     accounts for their own section; the principal and administrators, any. */
+  function boolish(v) { return v === true || v === 'true' || v === 'TRUE' || v === 1 || v === '1'; }
+  function randomPin() { return String(Math.floor(100000 + Math.random() * 900000)); }
+  function publicStudent(s, now) {
+    var locked = s.lockedUntil ? (new Date(s.lockedUntil).getTime() > now) : false;
+    return { lrn: String(s.lrn || ''), sectionId: s.sectionId, name: s.name,
+      issued: !!s.hash, activated: !!s.hash && !boolish(s.mustChange),
+      locked: locked, lockedUntil: locked ? s.lockedUntil : '',
+      lastLogin: s.lastLogin || '', qr: !!s.qrToken,
+      target2: s.t2target || '', target3: s.t3target || '' };
+  }
+  function canManageStudents(u, sectionId) {
+    if (u.admin || u.principal) return true;
+    if (!sectionId) return false;
+    return isAdviser(u, sectionId);
+  }
+  function manageableSections(u, dir) {
+    if (u.admin || u.principal) {
+      var seen = {}, out = [];
+      dir.assignments.forEach(function (a) { if (!seen[a.sectionId]) { seen[a.sectionId] = 1; out.push(a.sectionId); } });
+      return out;
+    }
+    return (u.advises || []).slice();
+  }
+
+  function publicUser(u) {
+    return { email: u.email, name: u.name, admin: u.admin, principal: u.principal, head: u.head,
+      role: u.role || '', teaches: u.teaches, advises: u.advises || [] };
+  }
+
+  /* ------------------------------------------------------------ server */
+  function recordId(sectionId, subject, part, term) {
+    return [sectionId, subject, part || 'X', 'T' + term].join('|');
+  }
+
+  function fail(msg, code) { var e = new Error(msg); e.code = code || 'bad_request'; throw e; }
+
+  function log(store, env, email, action, detail) {
+    try { store.append('log', { time: new Date(env.now()).toISOString(), email: email || '', action: action, detail: detail || '' }); } catch (e) { }
+  }
+
+  function startSession(store, env, email) {
+    var token = env.randomToken();
+    var now = env.now();
+    var rows = store.read('sessions').filter(function (s) { return Number(s.expires) > now; });
+    rows.push({ hash: env.sha256(token), email: email, expires: now + 30 * 24 * 3600 * 1000 });
+    store.write('sessions', rows);
+    return token;
+  }
+
+  function sessionEmail(store, env, token) {
+    if (!token) return null;
+    var h = env.sha256(token), now = env.now();
+    var rows = store.read('sessions');
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].hash === h && Number(rows[i].expires) > now) return rows[i].email;
+    }
+    return null;
+  }
+
+  function learnersFor(store, sectionIds) {
+    var all = null;
+    if (sectionIds !== '*') { all = {}; sectionIds.forEach(function (s) { all[s] = true; }); }
+    var out = {};
+    store.read('learners').forEach(function (l) {
+      if (all && !all[l.sectionId]) return;
+      (out[l.sectionId] = out[l.sectionId] || []).push({ key: l.key, name: l.name, sex: l.sex, order: Number(l.order), lrn: l.lrn ? String(l.lrn) : '' });
+    });
+    Object.keys(out).forEach(function (k) {
+      out[k].sort(function (a, b) { return a.order - b.order; });
+    });
+    return out;
+  }
+
+  function handle(req, store, env) {
+    var action = req.action;
+    var dir, user, email;
+
+    if (action === 'config') {
+      dir = readDirectory(store);
+      return { ok: true, googleClientId: dir.settings.googleClientId || '', schoolFull: dir.settings.schoolFull,
+        schoolYear: dir.settings.schoolYear, hasSetup: dir.assignments.length > 0, demo: !!env.demo };
+    }
+
+    if (action === 'requestCode') {
+      email = normEmail(req.email);
+      if (!validEmail(email)) fail('Enter a complete email address.');
+      dir = readDirectory(store);
+      user = resolveUser(email, dir, env);
+      if (!user.known) fail('This email is not listed as a subject teacher, checker or administrator. Ask the principal to add it.', 'unknown');
+      var rateKey = 'rate:' + email;
+      var n = Number(env.cacheGet(rateKey) || 0);
+      if (n >= 4) fail('Too many codes requested. Wait 15 minutes and try again.', 'rate');
+      env.cachePut(rateKey, String(n + 1), 900);
+      var code = String(Math.floor(100000 + Math.random() * 900000));
+      env.cachePut('code:' + email, JSON.stringify({ h: env.sha256(code), tries: 0 }), 600);
+      env.sendCode(email, code, dir.settings);
+      log(store, env, email, 'code-requested');
+      return { ok: true, sent: true, demoCode: env.demo ? code : undefined };
+    }
+
+    if (action === 'verifyCode') {
+      email = normEmail(req.email);
+      var raw = env.cacheGet('code:' + email);
+      if (!raw) fail('That code has expired. Request a new one.', 'expired');
+      var st = JSON.parse(raw);
+      if (st.tries >= 5) { env.cacheRemove('code:' + email); fail('Too many wrong tries. Request a new code.', 'expired'); }
+      if (env.sha256(clean(req.code)) !== st.h) {
+        st.tries++; env.cachePut('code:' + email, JSON.stringify(st), 600);
+        fail('That code is not right. Check the latest email and try again.', 'wrong_code');
+      }
+      env.cacheRemove('code:' + email);
+      dir = readDirectory(store);
+      user = resolveUser(email, dir, env);
+      if (!user.known) fail('This email is no longer on the list.', 'unknown');
+      log(store, env, email, 'signed-in', 'email code');
+      return { ok: true, token: startSession(store, env, email), user: publicUser(user) };
+    }
+
+    if (action === 'googleSignIn') {
+      dir = readDirectory(store);
+      if (!dir.settings.googleClientId) fail('Google sign-in is not set up on the server.');
+      email = normEmail(env.verifyGoogle(req.credential, dir.settings.googleClientId));
+      user = resolveUser(email, dir, env);
+      if (!user.known) fail('Signed in as ' + email + ', but this email is not listed as a subject teacher, checker or administrator.', 'unknown');
+      log(store, env, email, 'signed-in', 'google');
+      return { ok: true, token: startSession(store, env, email), user: publicUser(user) };
+    }
+
+    /* ---- everything below needs a session ---- */
+    email = sessionEmail(store, env, req.token);
+    if (!email) fail('Your session has ended. Please sign in again.', 'auth');
+    dir = readDirectory(store);
+    user = resolveUser(email, dir, env);
+    if (!user.known) fail('This email is no longer on the list of teachers and checkers.', 'auth');
+
+    if (action === 'signOut') {
+      var h = env.sha256(req.token);
+      store.write('sessions', store.read('sessions').filter(function (s) { return s.hash !== h && Number(s.expires) > env.now(); }));
+      return { ok: true };
+    }
+
+    if (action === 'bootstrap') {
+      var visible = dir.assignments.filter(function (a) { return canView(user, a.sectionId, a.subject, dir.settings); });
+      var secIds = {};
+      visible.forEach(function (a) { secIds[a.sectionId] = true; });
+      var sections = {};
+      dir.assignments.forEach(function (a) {
+        if (!secIds[a.sectionId] && !user.admin) return;
+        sections[a.sectionId] = { id: a.sectionId, grade: Number(a.grade), name: a.sectionName, label: a.section, adviser: a.adviser,
+          adviserEmail: user.admin ? (a.adviserEmail || '') : '' };
+      });
+      var meta = store.recordMeta().filter(function (r) { return canView(user, r.sectionId, r.subject, dir.settings); });
+      return {
+        ok: true, user: publicUser(user), settings: dir.settings,
+        sections: Object.keys(sections).map(function (k) { return sections[k]; }),
+        assignments: visible.map(function (a) { return { sectionId: a.sectionId, subject: a.subject, teacher: a.teacher,
+          email: user.admin ? a.email : (a.email ? '•' : ''), editable: canEdit(user, a.sectionId, a.subject) }; }),
+        checkers: dir.checkers.map(function (c) { return { name: c.name, role: c.role, subjects: c.subjects,
+          email: user.admin ? c.email : '' }; }),
+        teachers: user.admin ? dir.teachers : [],
+        learners: learnersFor(store, user.admin ? '*' : Object.keys(secIds)),
+        records: meta
+      };
+    }
+
+    if (action === 'getClass') {
+      if (!canView(user, req.sectionId, req.subject, dir.settings)) fail('You do not have access to this class record.', 'forbidden');
+      var ids = [];
+      var parts = req.subject === 'MAPEH' ? ['MA', 'PEH'] : ['X'];
+      parts.forEach(function (p) { [1, 2, 3].forEach(function (t) { ids.push(recordId(req.sectionId, req.subject, p, t)); }); });
+      return { ok: true, records: store.recordFull(ids), editable: canEdit(user, req.sectionId, req.subject),
+        learners: learnersFor(store, [req.sectionId])[req.sectionId] || [] };
+    }
+
+    if (action === 'saveRecord') {
+      if (!canEdit(user, req.sectionId, req.subject)) fail('Only the subject teacher assigned to this class can edit it.', 'forbidden');
+      var term = Number(req.term);
+      if ([1, 2, 3].indexOf(term) < 0) fail('Unknown term.');
+      var part = req.subject === 'MAPEH' ? req.part : 'X';
+      if (req.subject === 'MAPEH' && ['MA', 'PEH'].indexOf(part) < 0) fail('Unknown MAPEH component.');
+      var data = sanitizeData(req.data);
+      var id = recordId(req.sectionId, req.subject, part, term);
+      return env.withLock(function () {
+        var cur = store.recordMeta().filter(function (r) { return r.id === id; })[0];
+        var curRev = cur ? Number(cur.rev) : 0;
+        if (req.baseRev !== undefined && req.baseRev !== null && Number(req.baseRev) !== curRev) {
+          fail('This term was changed on another device (' + (cur.updatedBy || '') + ') after you opened it. Reload to get the latest scores.', 'conflict');
+        }
+        var w = (dir.settings.weights || {})[req.subject] || DEFAULT_SETTINGS.weights[req.subject];
+        var grades = gradesOf(computePart(data, w, dir.settings.stWeights));
+        var rec = { id: id, sectionId: req.sectionId, subject: req.subject, part: part, term: term,
+          rev: curRev + 1, updatedAt: new Date(env.now()).toISOString(), updatedBy: email,
+          checkedBy: cur ? cur.checkedBy : '', checkedAt: cur ? cur.checkedAt : '',
+          data: data, grades: grades };
+        store.upsertRecord(rec);
+        return { ok: true, rev: rec.rev, updatedAt: rec.updatedAt, grades: grades };
+      });
+    }
+
+    if (action === 'setChecked') {
+      if (!(user.head || user.principal)) fail('Only checkers can mark a class record as checked.', 'forbidden');
+      if (!canView(user, req.sectionId, req.subject, dir.settings)) fail('You do not have access to this class record.', 'forbidden');
+      var cparts = req.subject === 'MAPEH' ? ['MA', 'PEH'] : ['X'];
+      return env.withLock(function () {
+        var metaAll = store.recordMeta();
+        var stamp = req.checked ? (user.name + ' · ' + new Date(env.now()).toISOString()) : '';
+        cparts.forEach(function (p) {
+          var cid = recordId(req.sectionId, req.subject, p, Number(req.term));
+          var m = metaAll.filter(function (r) { return r.id === cid; })[0];
+          if (!m) return;
+          store.setChecked(cid, req.checked ? user.name : '', req.checked ? new Date(env.now()).toISOString() : '');
+        });
+        log(store, env, email, req.checked ? 'checked' : 'unchecked', req.sectionId + ' ' + req.subject + ' T' + req.term);
+        return { ok: true, stamp: stamp };
+      });
+    }
+
+    if (action === 'summaries') {
+      var rows = store.recordGrades().filter(function (r) { return canView(user, r.sectionId, r.subject, dir.settings); });
+      return { ok: true, records: rows };
+    }
+
+    if (action === 'importRecords') {
+      var items = req.records || [];
+      return env.withLock(function () {
+        var results = [];
+        items.forEach(function (it) {
+          var term = Number(it.term);
+          if (!user.admin && !canEdit(user, it.sectionId, it.subject)) { results.push({ ok: false, error: 'Only the subject teacher assigned to ' + it.sectionId + ' ' + it.subject + ' (or an administrator) can import it.' }); return; }
+          if ([1, 2, 3].indexOf(term) < 0) { results.push({ ok: false, error: 'Unknown term.' }); return; }
+          if (!SUBJ[it.subject]) { results.push({ ok: false, error: 'Unknown learning area.' }); return; }
+          var part = it.subject === 'MAPEH' ? it.part : 'X';
+          if (it.subject === 'MAPEH' && ['MA', 'PEH'].indexOf(part) < 0) { results.push({ ok: false, error: 'Unknown MAPEH component.' }); return; }
+          var data = sanitizeData(it.data);
+          var id = recordId(it.sectionId, it.subject, part, term);
+          var cur = store.recordMeta().filter(function (r) { return r.id === id; })[0];
+          var w = (dir.settings.weights || {})[it.subject] || DEFAULT_SETTINGS.weights[it.subject];
+          var grades = gradesOf(computePart(data, w, dir.settings.stWeights));
+          var rec = { id: id, sectionId: it.sectionId, subject: it.subject, part: part, term: term,
+            rev: (cur ? Number(cur.rev) : 0) + 1, updatedAt: new Date(env.now()).toISOString(), updatedBy: email,
+            checkedBy: cur ? cur.checkedBy : '', checkedAt: cur ? cur.checkedAt : '',
+            data: data, grades: grades };
+          store.upsertRecord(rec);
+          results.push({ ok: true, id: id, rev: rec.rev, updatedAt: rec.updatedAt, sectionId: it.sectionId, subject: it.subject, part: part, term: term, grades: grades });
+        });
+        log(store, env, email, 'records-imported', results.filter(function (r) { return r.ok; }).length + ' of ' + items.length + ' term records' + (req.fileName ? ' from ' + clean(req.fileName).slice(0, 80) : ''));
+        return { ok: true, results: results };
+      });
+    }
+
+    /* ---- student portal accounts ---- */
+    if (action === 'studentAccounts') {
+      var aSids = manageableSections(user, dir);
+      if (req.sectionId) {
+        if (!canManageStudents(user, req.sectionId)) fail('Only the class adviser or an administrator can see the portal accounts of this section.', 'forbidden');
+        aSids = [req.sectionId];
+      }
+      var aPick = {};
+      aSids.forEach(function (s) { aPick[s] = true; });
+      var aNow = env.now();
+      return { ok: true, sections: aSids, portalUrl: dir.settings.portalUrl || '',
+        accounts: store.read('students').filter(function (s) { return aPick[s.sectionId]; })
+          .map(function (s) { return publicStudent(s, aNow); }) };
+    }
+
+    if (action === 'issuePins') {
+      var iSid = req.sectionId;
+      if (!canManageStudents(user, iSid)) fail('Only the class adviser or an administrator can issue student PINs.', 'forbidden');
+      return env.withLock(function () {
+        var rows = store.read('students');
+        var byLrn = {}, byToken = {};
+        rows.forEach(function (s, i) { byLrn[String(s.lrn)] = i; if (s.qrToken) byToken[String(s.qrToken)] = 1; });
+        var only = null;
+        if (req.lrns && req.lrns.length) { only = {}; req.lrns.forEach(function (x) { only[clean(x)] = 1; }); }
+        var issued = [], skipped = [];
+        store.read('learners').forEach(function (l) {
+          if (l.sectionId !== iSid) return;
+          var lrn = clean(l.lrn);
+          if (only && !only[lrn]) return;
+          if (!lrn) { skipped.push({ name: l.name, reason: 'No LRN on the roster' }); return; }
+          var at = byLrn[lrn];
+          var was = at === undefined ? null : rows[at];
+          if (was && was.hash && !req.reissue) { skipped.push({ name: l.name, reason: 'Already has an account' }); return; }
+          var pin = randomPin(), salt = env.randomToken(), token = was && was.qrToken ? String(was.qrToken) : '';
+          while (!token) { var t = env.randomToken().replace(/-/g, '').slice(0, 20); if (!byToken[t]) { token = t; byToken[t] = 1; } }
+          var rec = { lrn: lrn, sectionId: iSid, key: l.key, name: l.name, qrToken: token,
+            hash: env.sha256(pin + salt), salt: salt, mustChange: 'true', fails: '0', lockedUntil: '', lastLogin: '',
+            t2target: was ? (was.t2target || '') : '', t3target: was ? (was.t3target || '') : '' };
+          if (at === undefined) { byLrn[lrn] = rows.length; rows.push(rec); } else rows[at] = rec;
+          issued.push({ lrn: lrn, name: l.name, pin: pin, qrToken: token });
+        });
+        if (issued.length) store.write('students', rows);
+        log(store, env, email, req.reissue ? 'student-pins-reset' : 'student-pins-issued',
+          iSid + ' \u00b7 ' + issued.length + ' account' + (issued.length === 1 ? '' : 's'));
+        return { ok: true, issued: issued, skipped: skipped };
+      });
+    }
+
+    if (action === 'studentUnlock') {
+      if (!canManageStudents(user, req.sectionId)) fail('Only the class adviser or an administrator can do this.', 'forbidden');
+      return env.withLock(function () {
+        var rows = store.read('students'), want = {}, n = 0;
+        (req.lrns || []).forEach(function (x) { want[clean(x)] = 1; });
+        rows.forEach(function (s) {
+          if (s.sectionId !== req.sectionId || !want[String(s.lrn)]) return;
+          s.fails = '0'; s.lockedUntil = ''; n++;
+        });
+        if (n) store.write('students', rows);
+        log(store, env, email, 'student-unlocked', req.sectionId + ' \u00b7 ' + n);
+        return { ok: true, unlocked: n };
+      });
+    }
+
+    /* ---- administration ---- */
+    if (!user.admin) fail('Only the principal or an administrator can do this.', 'forbidden');
+
+    if (action === 'saveDirectory') {
+      var d = req.directory || {};
+      var asg = (d.assignments || []).map(function (a) {
+        var ps = parseSection(a.section);
+        var sc = subjectCode(a.subject);
+        if (!ps || !sc) return null;
+        return { sectionId: ps.id, section: ps.label, grade: ps.grade, sectionName: ps.name, adviser: upper(a.adviser),
+          adviserEmail: a.adviserEmail && validEmail(normEmail(a.adviserEmail)) ? normEmail(a.adviserEmail) : '',
+          subject: sc, teacher: upper(a.teacher), email: a.email ? normEmail(a.email) : '' };
+      }).filter(Boolean);
+      var tch = (d.teachers || []).map(function (t) { return { name: upper(t.name), email: normEmail(t.email) }; });
+      var chk = (d.checkers || []).map(function (c) {
+        var hs = headSubjects(c.role);
+        return { name: clean(c.name), role: clean(c.role), email: normEmail(c.email),
+          subjects: hs === null ? '*' : (hs.length ? hs.join(',') : 'ALL') };
+      });
+      return env.withLock(function () {
+        store.write('assignments', asg);
+        store.write('teachers', tch);
+        store.write('checkers', chk);
+        var pr = chk.filter(function (c) { return c.subjects === '*'; })[0];
+        if (pr) saveSettingsRows(store, { principal: displayName(pr.name) });
+        log(store, env, email, 'directory-uploaded', asg.length + ' assignments');
+        return { ok: true, assignments: asg.length, teachers: tch.length, checkers: chk.length };
+      });
+    }
+
+    if (action === 'saveRoster') {
+      var secs = req.sections || {};
+      return env.withLock(function () {
+        var keep = store.read('learners').filter(function (l) { return !secs[l.sectionId]; });
+        var added = 0;
+        Object.keys(secs).forEach(function (sid) {
+          var seen = {};
+          (secs[sid] || []).forEach(function (l, i) {
+            var nm = clean(l.name);
+            if (!nm) return;
+            var k = nameKey(nm);
+            if (seen[k]) return;
+            seen[k] = true;
+            keep.push({ sectionId: sid, order: i + 1, sex: /^F/i.test(l.sex) ? 'F' : 'M', name: nm, key: k, lrn: clean(l.lrn).replace(/[^0-9A-Za-z-]/g, '').slice(0, 20) });
+            added++;
+          });
+        });
+        store.write('learners', keep);
+        log(store, env, email, 'roster-uploaded', Object.keys(secs).length + ' sections, ' + added + ' learners');
+        return { ok: true, sections: Object.keys(secs).length, learners: added };
+      });
+    }
+
+    if (action === 'saveSettings') {
+      var allowed = ['schoolFull', 'schoolName', 'schoolId', 'region', 'division', 'schoolYear', 'order', 'principal',
+        'weights', 'stWeights', 'adminEmails', 'headsViewAll', 'googleClientId', 'portalUrl'];
+      var patch = {};
+      allowed.forEach(function (k) { if (req.settings && req.settings[k] !== undefined) patch[k] = req.settings[k]; });
+      if (patch.adminEmails) patch.adminEmails = patch.adminEmails.map(normEmail).filter(validEmail);
+      saveSettingsRows(store, patch);
+      log(store, env, email, 'settings-saved', Object.keys(patch).join(', '));
+      return { ok: true };
+    }
+
+    if (action === 'log') {
+      return { ok: true, rows: store.read('log').slice(-300).reverse() };
+    }
+
+    fail('Unknown action: ' + action);
+  }
+
+  function saveSettingsRows(store, patch) {
+    var rows = store.read('settings');
+    Object.keys(patch).forEach(function (k) {
+      var v = JSON.stringify(patch[k]);
+      var r = rows.filter(function (x) { return x.key === k; })[0];
+      if (r) r.value = v; else rows.push({ key: k, value: v });
+    });
+    store.write('settings', rows);
+  }
+
+  function sanitizeData(d) {
+    d = d || {};
+    var cols = function (x, min, max) {
+      x = x || {};
+      var hps = (x.hps || []).slice(0, max).map(function (v) { var n = num(v); return n === null ? '' : n; });
+      while (hps.length < min) hps.push('');
+      return { hps: hps, desc: (x.desc || []).slice(0, max).map(function (s) { return clean(s).slice(0, 120); }),
+        date: (x.date || []).slice(0, max).map(function (s) { return clean(s).slice(0, 20); }) };
+    };
+    var out = { ww: cols(d.ww, 5, 15), pt: cols(d.pt, 3, 15), st: cols(d.st, 3, 3), sc: {} };
+    if (d.calc && typeof d.calc === 'object') {
+      var c = d.calc, cc = {};
+      var w3 = function (a) { return (a && a.length === 3 && a.every(function (x) { return num(x) !== null; })) ? a.map(Number) : undefined; };
+      if (w3(c.w)) cc.w = w3(c.w);
+      if (w3(c.stW)) cc.stW = w3(c.stW);
+      if (c.st === 'sum' || c.st === 'weighted') cc.st = c.st;
+      if (c.round === true || c.round === false) cc.round = c.round;
+      if (['any', 'all', 'te'].indexOf(c.ig) >= 0) cc.ig = c.ig;
+      if (c.source) cc.source = clean(c.source).slice(0, 160);
+      out.calc = cc;
+    }
+    Object.keys(d.sc || {}).forEach(function (k) {
+      var r = d.sc[k] || {};
+      var f = function (a, n) { return (a || []).slice(0, n).map(function (v) { var x = num(v); return x === null ? '' : x; }); };
+      var row = { w: f(r.w, out.ww.hps.length), p: f(r.p, out.pt.hps.length), s: f(r.s, 3) };
+      if (row.w.concat(row.p, row.s).some(function (v) { return v !== ''; })) out.sc[String(k).slice(0, 120)] = row;
+    });
+    return out;
+  }
+
+  return {
+    SUBJECTS: SUBJECTS, SUBJ: SUBJ, DEFAULT_SETTINGS: DEFAULT_SETTINGS, TRANSMU: TRANSMU, SCALE: SCALE, DEPED: DEPED,
+    clean: clean, upper: upper, nameKey: nameKey, normEmail: normEmail, validEmail: validEmail,
+    subjectCode: subjectCode, parseSection: parseSection, sectionId: sectionId, displayName: displayName, headSubjects: headSubjects,
+    r2: r2, r0: r0, num: num, transmute: transmute, band: band, descriptor: descriptor, emptyPart: emptyPart,
+    computePart: computePart, gradesOf: gradesOf, avgRound: avgRound, counts: counts,
+    resolveUser: resolveUser, canEdit: canEdit, canView: canView, canViewAny: canViewAny, isAdviser: isAdviser,
+    canManageStudents: canManageStudents, manageableSections: manageableSections, boolish: boolish,
+    recordId: recordId, handle: handle, sanitizeData: sanitizeData
+  };
+})();
+/* ====================================================================
+   CANHS TSEK — Students' Proficiency Portal (Google Apps Script server)
+
+   The code above (CR) is the SAME shared core that the Class Records
+   server and website run, so a grade a learner sees here is computed by
+   exactly the same rules the teacher's class record uses. Do not edit it
+   here: download a fresh Code.gs from the Class Records site whenever the
+   core changes, so the two never drift apart.
+
+   Where the grades come from
+   --------------------------
+   Nothing is read from the old per-subject "Class Record" spreadsheets any
+   more. Everything comes from the ONE Class Records data spreadsheet that
+   the Proficiency Level and Class Records site writes to:
+
+     learners     who is in which section, and their LRN
+     assignments  section labels, advisers, and the teacher of each subject
+     records      the class records themselves (scores + computation rules)
+     settings     school name, school year, component weights
+     students     portal sign-in (LRN, QR token, salted PIN hash, targets)
+
+   Learners are matched to their row of a class record by the learner key
+   the class records already use, so adding a section or a learning area
+   needs no change here at all.
+
+   SETUP (about five minutes)
+   --------------------------
+   1. Open the Class Records data spreadsheet and copy its ID from the
+      address bar - the long code between /d/ and /edit.
+   2. Paste it into CLASS_RECORDS_SHEET_ID below and save.
+   3. In the toolbar dropdown choose "setUpPortal" and click Run. Google
+      will ask you to authorise the script the first time; approve it. It
+      checks that it can read the spreadsheet and creates the "students"
+      tab if the Class Records site has not created it yet.
+   4. Deploy > New deployment > type "Web app" > Execute as: Me >
+      Who has access: Anyone > Deploy. Give that /exec address to the
+      learners (and paste it into the Class Records site, on the
+      Student Portal page, so it is printed on the PIN slips).
+
+   Issuing PINs is done from the Class Records site (Student Portal page)
+   by the class adviser. If you would rather do it from here, run
+   "issuePinsForEverySection" once and read the "Portal PINs" tab it makes.
+   ==================================================================== */
+
+/* ---------------------------------------------------------------- config */
+
+/* The Class Records data spreadsheet - the one the Proficiency Level and
+   Class Records server writes to. Leave blank ONLY if you paste this file
+   into that spreadsheet's own Apps Script project. */
+var CLASS_RECORDS_SHEET_ID = '';
+
+var PORTAL_TITLE = 'CANHS TSEK';
+var PORTAL_SUBTITLE = "Students' Proficiency Level";
+
+/* How long a learner stays signed in, and how long a computed report is
+   reused before the spreadsheet is read again (the Refresh button always
+   reads afresh). */
+var SESSION_TTL_SECONDS = 3 * 60 * 60;
+var REPORT_CACHE_SECONDS = 5 * 60;
+
+/* Wrong-PIN protection. */
+var MAX_FAILED_ATTEMPTS = 5;
+var LOCKOUT_MINUTES = 15;
+var MIN_PIN_DIGITS = 6;
+var MAX_PIN_DIGITS = 8;
+
+/* Set to true to show a term only after the department head has ticked
+   the class record as checked. False shows grades as soon as the teacher
+   has entered them. */
+var ONLY_CHECKED_RECORDS = false;
+
+/* What a learner may set as their own goal for the coming terms. */
+var TARGET_OPTIONS = ['Promoted', 'Promoted with Honors', 'Promoted with High Honors', 'Promoted with Highest Honors'];
+
+/* Report-card order of the learning areas. */
+var CARD_ORDER = ['FIL', 'ENG', 'MATH', 'SCI', 'AP', 'VE', 'TLE', 'MAPEH'];
+var PART_LABEL = { X: '', MA: 'Music and Arts', PEH: 'PE and Health' };
+var TERMS = [1, 2, 3];
+
+/* Columns of the tabs this portal reads. They must match the Class
+   Records server's TABLES exactly. */
+var TABLES = {
+  settings: ['key', 'value'],
+  assignments: ['sectionId', 'section', 'grade', 'sectionName', 'adviser', 'adviserEmail', 'subject', 'teacher', 'email'],
+  learners: ['sectionId', 'order', 'sex', 'name', 'key', 'lrn'],
+  students: ['lrn', 'sectionId', 'key', 'name', 'qrToken', 'hash', 'salt', 'mustChange', 'fails', 'lockedUntil', 'lastLogin', 't2target', 't3target'],
+  records: ['id', 'sectionId', 'subject', 'part', 'term', 'rev', 'updatedAt', 'updatedBy', 'checkedBy', 'checkedAt', 'grades', 'data0', 'data1', 'data2', 'data3', 'data4', 'data5']
+};
+
+/* QR codes already printed on the 2026-2027 Grade 7 - Adorable ID cards.
+   Keyed by LRN, so those cards keep working the moment an account is
+   issued. Cards printed from now on carry the token the portal generates;
+   this list can be emptied once every card has been reissued. */
+var LEGACY_QR_TOKENS = {
+  '109825190069': '7f58286f4d62720a328c', '428545190019': '0444f1b603ce5cce5959',
+  '109825190049': 'b01133000557e8dda1aa', '109814190002': '164b8cdd3bc198ba0eeb',
+  '409942190067': 'ac5e7a69fe768ea713e3', '136574190128': '05ad7ec7a3a77f8b1b12',
+  '428551190006': 'bcf534ada3a162ad2739', '108314190053': 'b090eb4b229c19efaea2',
+  '109825180177': 'f23563d14d47884c37d7', '109825190096': '0d23271b648ad0be8fa2',
+  '108314190036': '1a954b164979c2d269eb', '109825190098': '8666769ffc5c65a23489',
+  '109825190127': '9b72c785f47b71392d68', '109825190143': 'd74e959c111f1fc8e2a5',
+  '109825190155': '8b3aca1f46e0e2f90a53', '109825190209': '56f1cc7825bceda1b983',
+  '109825190156': '9271fb9de924c296cd4c', '109825190210': '38a15153daa194ef70da',
+  '109825190159': 'f98aa897a752b0eb9fee', '425559190032': 'd304484331ca5989246f',
+  '403334190012': '74cc0f3f58df107e7488', '108559190015': 'b157a098b4a93bf01ee8',
+  '109825190081': 'c55ef0a0c45c583763a6', '109825190163': 'ff34015100541cbc6b8c',
+  '109825190013': '28eb27c417e0e22ebcf8', '109825190164': '166a9c9897b2940a3481',
+  '109825190106': '296ec43a44f216045ae2', '109825190087': '68d2c13e35e5ddfdaae7',
+  '109825190168': 'ff4f8d98e153c920edbd', '428545190010': 'b9ef26527e28b0e56516',
+  '109825190039': '8800f1ba296dd6e09ba8', '108314190058': 'f071746c6a9c3ccf7150',
+  '109825190169': '04f5725324168834fd94', '109825190065': 'f3770ff56796e1adb6bc',
+  '109825190090': '6714276232450ad267f9', '109825190091': '1237d94e5f08f44d1efb',
+  '109825190108': '800fd5a0f25c529faa39', '109825190112': '9df6f44e82a3e60cd71e',
+  '428551190022': '1dd9d94bd8b588fddb02', '109825190193': '32e3f1bbaa06e15256b3',
+  '428545190003': 'd2d3984cdd5028c12b52', '109825190136': '31ce80c122b473d258ba',
+  '109825190194': '1c692f311ecee2f3d940', '109825190138': 'ed3e460513d7e8f608ca',
+  '428545190013': '1291eb8b07512880ac13', '108314190043': 'af681b695f7c2527a417',
+  '428551190024': '87aa940f8c8522736cd7', '410122190005': '0c8da9a58f5b9ee8ebe6'
+};
+
+/* ---------------------------------------------------------------- web app */
+
+function doGet(e) {
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle(PORTAL_TITLE)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+/* ---------------------------------------------------------------- store */
+
+function ss_() {
+  return CLASS_RECORDS_SHEET_ID
+    ? SpreadsheetApp.openById(CLASS_RECORDS_SHEET_ID)
+    : SpreadsheetApp.getActiveSpreadsheet();
+}
+
+var SHEET_CACHE_ = {};
+function sheet_(t, createIfMissing) {
+  if (SHEET_CACHE_[t]) return SHEET_CACHE_[t];
+  var book = ss_();
+  if (!book) throw portalError_('The portal is not connected to the Class Records spreadsheet yet. Ask your teacher.');
+  var sh = book.getSheetByName(t);
+  if (!sh) {
+    if (!createIfMissing) return null;
+    var cols = TABLES[t];
+    sh = book.insertSheet(t);
+    sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, sh.getMaxRows(), cols.length).setNumberFormat('@');
+  }
+  SHEET_CACHE_[t] = sh;
+  return sh;
+}
+
+function headIndex_(sh, cols) {
+  var head = sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), cols.length)).getValues()[0];
+  return cols.map(function (c) { return head.indexOf(c); });
+}
+
+function readT_(t) {
+  var sh = sheet_(t);
+  if (!sh) return [];
+  var cols = TABLES[t];
+  var last = sh.getLastRow();
+  if (last < 2) return [];
+  var idx = headIndex_(sh, cols);
+  var width = Math.max(sh.getLastColumn(), cols.length);
+  var vals = sh.getRange(2, 1, last - 1, width).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    var r = vals[i];
+    var blank = true;
+    for (var j = 0; j < r.length; j++) if (r[j] !== '') { blank = false; break; }
+    if (blank) continue;
+    /* __row is the real sheet row, so a single cell can be written back
+       even if there are blank rows above it. */
+    var o = { __row: i + 2 };
+    for (var k = 0; k < cols.length; k++) {
+      var v = idx[k] >= 0 ? r[idx[k]] : '';
+      o[cols[k]] = v instanceof Date ? v.toISOString() : v;
+    }
+    out.push(o);
+  }
+  return out;
+}
+
+function writeT_(t, rows) {
+  var sh = sheet_(t, true), cols = TABLES[t];
+  var last = sh.getLastRow();
+  if (last > 1) sh.getRange(2, 1, last - 1, Math.max(sh.getLastColumn(), cols.length)).clearContent();
+  sh.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
+  if (!rows.length) return;
+  var vals = rows.map(function (o) { return cols.map(function (c) { return o[c] === undefined || o[c] === null ? '' : String(o[c]); }); });
+  var rng = sh.getRange(2, 1, vals.length, cols.length);
+  rng.setNumberFormat('@');
+  rng.setValues(vals);
+}
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(25000);
+  try { return fn(); } finally { SpreadsheetApp.flush(); lock.releaseLock(); }
+}
+
+function cache_() { return CacheService.getScriptCache(); }
+
+function portalError_(msg) { var e = new Error(msg); e.portal = true; return e; }
+function said_(e) { return e && e.portal ? e.message : 'Something went wrong on the school server. Try again in a moment.'; }
+
+/* ---------------------------------------------------------------- hashing */
+
+function sha256_(s) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(s), Utilities.Charset.UTF_8)
+    .map(function (b) { return ((b + 256) % 256).toString(16); })
+    .map(function (h) { return h.length < 2 ? '0' + h : h; }).join('');
+}
+function randomToken_() { return (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, ''); }
+function randomPin_() { return String(Math.floor(100000 + Math.random() * 900000)); }
+
+/* ---------------------------------------------------------------- settings */
+
+function settings_() {
+  var cached = cache_().get('portal.settings');
+  if (cached) { try { return JSON.parse(cached); } catch (e) { } }
+  var out = {};
+  Object.keys(CR.DEFAULT_SETTINGS).forEach(function (k) { out[k] = CR.DEFAULT_SETTINGS[k]; });
+  readT_('settings').forEach(function (r) {
+    try { out[r.key] = JSON.parse(r.value); } catch (e) { out[r.key] = r.value; }
+  });
+  cache_().put('portal.settings', JSON.stringify(out), REPORT_CACHE_SECONDS);
+  return out;
+}
+
+/* Section label, adviser and the teacher of each learning area. */
+function sectionInfo_(sectionId) {
+  var key = 'portal.sec.' + sectionId;
+  var cached = cache_().get(key);
+  if (cached) { try { return JSON.parse(cached); } catch (e) { } }
+  var info = { id: sectionId, label: sectionId, grade: '', name: '', adviser: '', teachers: {} };
+  readT_('assignments').forEach(function (a) {
+    if (a.sectionId !== sectionId) return;
+    info.label = a.section || sectionId;
+    info.grade = a.grade;
+    info.name = a.sectionName || '';
+    if (a.adviser) info.adviser = CR.displayName(a.adviser);
+    if (a.subject) info.teachers[a.subject] = CR.displayName(a.teacher);
+  });
+  cache_().put(key, JSON.stringify(info), REPORT_CACHE_SECONDS);
+  return info;
+}
+
+/* ---------------------------------------------------------------- records */
+
+/* Row number of every class record of one section, by record id. Rows are
+   only appended or overwritten in place, never deleted, so the map is safe
+   to reuse for a few minutes. */
+function recordRowMap_(sectionId, fresh) {
+  var key = 'portal.rows.' + sectionId;
+  if (!fresh) {
+    var cached = cache_().get(key);
+    if (cached) { try { return JSON.parse(cached); } catch (e) { } }
+  }
+  var map = {};
+  var sh = sheet_('records');
+  if (!sh) return map;
+  var last = sh.getLastRow();
+  if (last < 2) return map;
+  var head = sh.getRange(2, 1, last - 1, 2).getValues();
+  for (var i = 0; i < head.length; i++) {
+    if (String(head[i][1]) === sectionId && head[i][0]) map[String(head[i][0])] = i + 2;
+  }
+  cache_().put(key, JSON.stringify(map), REPORT_CACHE_SECONDS);
+  return map;
+}
+
+/* Reads the wanted class records in as few spreadsheet calls as possible:
+   one block read when the rows sit close together, otherwise row by row. */
+function readRecords_(sectionId, ids, fresh) {
+  var map = recordRowMap_(sectionId, fresh);
+  var rows = [];
+  ids.forEach(function (id) { if (map[id]) rows.push({ id: id, row: map[id] }); });
+  if (!rows.length) return {};
+  var sh = sheet_('records');
+  var width = TABLES.records.length;
+  var lo = rows[0].row, hi = rows[0].row;
+  rows.forEach(function (r) { if (r.row < lo) lo = r.row; if (r.row > hi) hi = r.row; });
+  var out = {}, block = null;
+  if (hi - lo + 1 <= rows.length * 3 + 6) block = sh.getRange(lo, 1, hi - lo + 1, width).getValues();
+  rows.forEach(function (r) {
+    var raw = block ? block[r.row - lo] : sh.getRange(r.row, 1, 1, width).getValues()[0];
+    var rec = { id: String(raw[0]), sectionId: String(raw[1]), subject: String(raw[2]), part: String(raw[3]),
+      term: Number(raw[4]), rev: Number(raw[5]), updatedAt: String(raw[6]), updatedBy: String(raw[7]),
+      checkedBy: String(raw[8]), checkedAt: String(raw[9]) };
+    try { rec.grades = JSON.parse(raw[10] || '{}'); } catch (e) { rec.grades = {}; }
+    try { rec.data = JSON.parse(raw.slice(11, 17).join('') || 'null'); } catch (e) { rec.data = null; }
+    out[rec.id] = rec;
+  });
+  return out;
+}
+
+/* ---------------------------------------------------------------- accounts */
+
+function findStudent_(identifier) {
+  var target = CR.clean(identifier).toUpperCase();
+  if (!target) return null;
+  var rows = readT_('students');
+  for (var i = 0; i < rows.length; i++) {
+    var lrn = String(rows[i].lrn || '').trim().toUpperCase();
+    var qr = String(rows[i].qrToken || '').trim().toUpperCase();
+    if ((lrn && lrn === target) || (qr && qr === target)) return { rowIndex: rows[i].__row, values: rows[i] };
+  }
+  return null;
+}
+
+function writeStudentCells_(rowIndex, patch) {
+  var sh = sheet_('students', true);
+  var cols = TABLES.students;
+  var idx = headIndex_(sh, cols);
+  Object.keys(patch).forEach(function (k) {
+    var at = cols.indexOf(k);
+    if (at < 0 || idx[at] < 0) return;
+    sh.getRange(rowIndex, idx[at] + 1).setNumberFormat('@').setValue(patch[k] === null || patch[k] === undefined ? '' : String(patch[k]));
+  });
+}
+
+function newSession_(lrn) {
+  var token = randomToken_();
+  cache_().put('portal.session.' + token, String(lrn), SESSION_TTL_SECONDS);
+  return token;
+}
+function sessionLrn_(token) {
+  if (!token) return null;
+  return cache_().get('portal.session.' + token);
+}
+
+/* ---------------------------------------------------------------- sign in */
+
+function portalConfig() {
+  var st;
+  try { st = settings_(); } catch (e) { st = CR.DEFAULT_SETTINGS; }
+  return {
+    ok: true,
+    title: PORTAL_TITLE,
+    subtitle: PORTAL_SUBTITLE,
+    schoolFull: st.schoolFull,
+    schoolName: st.schoolName,
+    division: st.division,
+    region: st.region,
+    schoolYear: st.schoolYear,
+    minPin: MIN_PIN_DIGITS,
+    maxPin: MAX_PIN_DIGITS
+  };
+}
+
+/**
+ * identifier - the LRN typed by the learner, or the token read from the QR
+ * code on their school ID. pin - their 6-digit PIN.
+ */
+function login(identifier, pin) {
+  try {
+    identifier = CR.clean(identifier);
+    pin = CR.clean(pin);
+    if (!identifier || !pin) return { ok: false, error: 'Enter your LRN (or scan your ID) and your PIN.' };
+
+    var rec = findStudent_(identifier);
+    if (!rec || !rec.values.hash) {
+      return { ok: false, error: 'No portal account was found for that LRN. Ask your class adviser to issue your PIN.' };
+    }
+    var v = rec.values;
+    var now = Date.now();
+
+    if (v.lockedUntil) {
+      var until = new Date(v.lockedUntil).getTime();
+      if (until > now) {
+        return { ok: false, error: 'Too many wrong PINs. Try again in ' + Math.max(1, Math.round((until - now) / 60000)) + ' minute(s).' };
+      }
+    }
+
+    if (sha256_(pin + v.salt) !== String(v.hash)) {
+      var fails = (Number(v.fails) || 0) + 1;
+      var lockedUntil = fails >= MAX_FAILED_ATTEMPTS ? new Date(now + LOCKOUT_MINUTES * 60000).toISOString() : '';
+      withLock_(function () { writeStudentCells_(rec.rowIndex, { fails: fails, lockedUntil: lockedUntil }); });
+      return { ok: false, error: lockedUntil
+        ? 'That PIN is not right. For safety the account is locked for ' + LOCKOUT_MINUTES + ' minutes.'
+        : 'That PIN is not right. ' + (MAX_FAILED_ATTEMPTS - fails) + ' tr' + (MAX_FAILED_ATTEMPTS - fails === 1 ? 'y' : 'ies') + ' left.' };
+    }
+
+    withLock_(function () { writeStudentCells_(rec.rowIndex, { fails: 0, lockedUntil: '', lastLogin: new Date().toISOString() }); });
+    return {
+      ok: true,
+      token: newSession_(v.lrn),
+      name: v.name,
+      mustChangePin: CR.boolish(v.mustChange)
+    };
+  } catch (e) {
+    return { ok: false, error: said_(e) };
+  }
+}
+
+function logout(token) {
+  if (token) cache_().remove('portal.session.' + token);
+  return { ok: true };
+}
+
+function changePin(token, oldPin, newPin) {
+  try {
+    var lrn = sessionLrn_(token);
+    if (!lrn) return { ok: false, error: 'You have been signed out. Please sign in again.', code: 'auth' };
+    oldPin = CR.clean(oldPin); newPin = CR.clean(newPin);
+    var re = new RegExp('^\\d{' + MIN_PIN_DIGITS + ',' + MAX_PIN_DIGITS + '}$');
+    if (!re.test(newPin)) {
+      return { ok: false, error: 'Your new PIN must be ' + MIN_PIN_DIGITS + ' to ' + MAX_PIN_DIGITS + ' digits.' };
+    }
+    if (/^(\d)\1+$/.test(newPin)) return { ok: false, error: 'Please choose a PIN that is not the same digit repeated.' };
+
+    var rec = findStudent_(lrn);
+    if (!rec) return { ok: false, error: 'Account not found.' };
+    if (sha256_(oldPin + rec.values.salt) !== String(rec.values.hash)) {
+      return { ok: false, error: 'Your current PIN is not right.' };
+    }
+    if (newPin === oldPin) return { ok: false, error: 'Please choose a PIN different from the one you were given.' };
+
+    var salt = randomToken_();
+    withLock_(function () {
+      writeStudentCells_(rec.rowIndex, { hash: sha256_(newPin + salt), salt: salt, mustChange: 'false', fails: 0, lockedUntil: '' });
+    });
+    cache_().remove('portal.report.' + lrn);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: said_(e) };
+  }
+}
+
+function saveTargets(token, target2, target3) {
+  try {
+    var lrn = sessionLrn_(token);
+    if (!lrn) return { ok: false, error: 'You have been signed out. Please sign in again.', code: 'auth' };
+    target2 = CR.clean(target2); target3 = CR.clean(target3);
+    if (target2 && TARGET_OPTIONS.indexOf(target2) < 0) return { ok: false, error: 'That is not one of the goals you can choose.' };
+    if (target3 && TARGET_OPTIONS.indexOf(target3) < 0) return { ok: false, error: 'That is not one of the goals you can choose.' };
+    var rec = findStudent_(lrn);
+    if (!rec) return { ok: false, error: 'Account not found.' };
+    withLock_(function () { writeStudentCells_(rec.rowIndex, { t2target: target2, t3target: target3 }); });
+    cache_().remove('portal.report.' + lrn);
+    return { ok: true, targets: { term2: target2, term3: target3 } };
+  } catch (e) {
+    return { ok: false, error: said_(e) };
+  }
+}
+
+/* ---------------------------------------------------------------- grades */
+
+function itemList_(comp, row, field, n) {
+  var out = [];
+  var hps = comp.hps || [], desc = comp.desc || [], date = comp.date || [];
+  for (var i = 0; i < n; i++) {
+    var max = CR.num(hps[i]);
+    var got = CR.num((row || [])[i]);
+    if (max === null && got === null && !CR.clean(desc[i])) continue;
+    out.push({
+      n: i + 1,
+      hps: max,
+      score: got,
+      desc: CR.clean(desc[i]).slice(0, 70),
+      date: CR.clean(date[i]).slice(0, 20),
+      pct: (max && got !== null) ? CR.r0(got / max * 100) : null
+    });
+  }
+  return out;
+}
+
+function sumHps_(hps) {
+  var t = 0, n = 0;
+  (hps || []).forEach(function (v) { var x = CR.num(v); if (x !== null) { t += x; n++; } });
+  return n ? t : null;
+}
+
+/* One part (X, or MA / PEH for MAPEH) of one subject in one term, as the
+   learner sees it: every item with its description, date, highest possible
+   score and the learner's own score, plus the totals the class record shows. */
+function partBlock_(rec, learnerKey, weights, stWeights) {
+  var data = rec && rec.data;
+  if (!data) {
+    var stored = rec && rec.grades ? CR.num(rec.grades[learnerKey]) : null;
+    if (stored === null) return null;
+    return { part: rec.part, label: PART_LABEL[rec.part] || '', grade: stored, initial: null,
+      ww: null, pt: null, st: null, detail: false,
+      updatedAt: rec.updatedAt, checkedBy: rec.checkedBy || '' };
+  }
+  var row = (data.sc || {})[learnerKey];
+  var mini = { ww: data.ww, pt: data.pt, st: data.st, calc: data.calc, sc: {} };
+  mini.sc[learnerKey] = row || { w: [], p: [], s: [] };
+  var res = CR.computePart(mini, weights, stWeights)[learnerKey] || {};
+  var w = (data.calc && data.calc.w && data.calc.w.length === 3) ? data.calc.w.map(Number) : weights;
+  /* How the class record adds up the summative component: 'weighted' puts
+     WS ST1 + WS ST2 + WS TE together (the total IS the percentage score, so
+     there is no raw total to show), 'sum' totals the raw scores over the
+     total highest possible score like the other two components. */
+  var stMode = (data.calc && data.calc.st === 'sum') ? 'sum' : 'weighted';
+  var comp = function (c, scores, key, n) {
+    var out = {
+      items: itemList_(c || {}, scores, key, n),
+      total: res[key] === undefined ? null : res[key],
+      hps: sumHps_((c || {}).hps),
+      ps: res[key + 'PS'] === undefined ? null : res[key + 'PS'],
+      ws: res[key + 'WS'] === undefined ? null : res[key + 'WS']
+    };
+    if (key === 'st') {
+      out.mode = stMode;
+      if (stMode === 'weighted') out.total = null;
+    }
+    return out;
+  };
+  return {
+    part: rec.part,
+    label: PART_LABEL[rec.part] || '',
+    detail: true,
+    weights: [CR.r2(w[0] * 100), CR.r2(w[1] * 100), CR.r2(w[2] * 100)],
+    ww: comp(data.ww, (row || {}).w, 'ww', ((data.ww || {}).hps || []).length),
+    pt: comp(data.pt, (row || {}).p, 'pt', ((data.pt || {}).hps || []).length),
+    st: comp(data.st, (row || {}).s, 'st', 3),
+    initial: res.initial === undefined ? null : res.initial,
+    grade: res.grade === undefined ? null : res.grade,
+    updatedAt: rec.updatedAt,
+    checkedBy: rec.checkedBy || ''
+  };
+}
+
+/* The MAPEH term grade, exactly as the MAPEH class record's FINAL GRADES
+   sheet computes it: the average of the component term grades that exist,
+   rounded to a whole number. */
+function mapehGrade_(ma, peh) {
+  var v = [ma, peh].filter(function (x) { return x !== null && x !== undefined && x !== ''; }).map(Number);
+  return v.length ? CR.r0(v.reduce(function (a, b) { return a + b; }, 0) / v.length) : null;
+}
+
+function bandOf_(g) {
+  if (g === null || g === undefined) return { level: '', range: '', deped: '', depedRange: '' };
+  var s = CR.band(CR.SCALE, g) || {}, d = CR.band(CR.DEPED, g) || {};
+  return { level: s.label || '', range: s.range || '', deped: d.label || '', depedRange: d.range || '' };
+}
+
+/* DepEd honour brackets, on the general average rounded to a whole number. */
+function honorOf_(avg) {
+  if (avg === null || avg === undefined) return '';
+  var r = CR.r0(avg);
+  if (r >= 98) return 'With Highest Honors';
+  if (r >= 95) return 'With High Honors';
+  if (r >= 90) return 'With Honors';
+  return '';
+}
+
+function averageOf_(list) {
+  var v = list.filter(function (x) { return x !== null && x !== undefined; }).map(Number);
+  if (!v.length) return null;
+  return CR.r2(v.reduce(function (a, b) { return a + b; }, 0) / v.length);
+}
+
+function buildReport_(student, fresh) {
+  var st = settings_();
+  var sec = sectionInfo_(student.sectionId);
+  var key = String(student.key || CR.nameKey(student.name));
+
+  var ids = [];
+  CARD_ORDER.forEach(function (code) {
+    var parts = code === 'MAPEH' ? ['MA', 'PEH'] : ['X'];
+    parts.forEach(function (p) {
+      TERMS.forEach(function (t) { ids.push(CR.recordId(student.sectionId, code, p, t)); });
+    });
+  });
+  var recs = readRecords_(student.sectionId, ids, fresh);
+
+  var subjects = [], perTerm = { 1: [], 2: [], 3: [] }, lastUpdated = '';
+  CARD_ORDER.forEach(function (code) {
+    var weights = (st.weights || {})[code] || CR.DEFAULT_SETTINGS.weights[code];
+    var parts = code === 'MAPEH' ? ['MA', 'PEH'] : ['X'];
+    var termGrades = [];
+    var terms = {};
+    TERMS.forEach(function (t) {
+      var blocks = [], anyRecord = false, anyChecked = false;
+      parts.forEach(function (p) {
+        var rec = recs[CR.recordId(student.sectionId, code, p, t)];
+        if (!rec) return;
+        anyRecord = true;
+        if (rec.checkedBy) anyChecked = true;
+        if (rec.updatedAt && rec.updatedAt > lastUpdated) lastUpdated = rec.updatedAt;
+        var b = partBlock_(rec, key, weights, st.stWeights);
+        if (b) blocks.push(b);
+      });
+      if (!anyRecord || (ONLY_CHECKED_RECORDS && !anyChecked)) { terms[t] = null; termGrades.push(null); return; }
+      var grade = code === 'MAPEH'
+        ? mapehGrade_(blockGrade_(blocks, 'MA'), blockGrade_(blocks, 'PEH'))
+        : (blocks.length ? blocks[0].grade : null);
+      if (grade === undefined) grade = null;
+      terms[t] = {
+        grade: grade,
+        band: bandOf_(grade),
+        parts: blocks,
+        checked: anyChecked,
+        inProgress: grade === null && blocks.some(function (b) { return b.detail && (b.ww.total !== null || b.pt.total !== null || b.st.total !== null); })
+      };
+      termGrades.push(grade);
+      if (grade !== null) perTerm[t].push(grade);
+    });
+    var fin = CR.avgRound(termGrades);
+    subjects.push({
+      code: code,
+      label: (CR.SUBJ[code] || { label: code }).label,
+      teacher: sec.teachers[code] || '',
+      terms: terms,
+      termGrades: termGrades,
+      final: fin,
+      finalBand: bandOf_(fin)
+    });
+  });
+
+  var summary = {};
+  TERMS.forEach(function (t) {
+    var avg = averageOf_(perTerm[t]);
+    summary[t] = {
+      average: avg,
+      graded: perTerm[t].length,
+      of: CARD_ORDER.length,
+      band: bandOf_(avg === null ? null : CR.r0(avg)),
+      honor: honorOf_(avg)
+    };
+  });
+  var finals = subjects.map(function (s) { return s.final; });
+  var finalAvg = finals.every(function (v) { return v !== null; }) ? averageOf_(finals) : null;
+  summary.final = {
+    average: finalAvg,
+    graded: finals.filter(function (v) { return v !== null; }).length,
+    of: CARD_ORDER.length,
+    band: bandOf_(finalAvg === null ? null : CR.r0(finalAvg)),
+    honor: honorOf_(finalAvg)
+  };
+
+  return {
+    ok: true,
+    student: {
+      name: student.name,
+      lrn: String(student.lrn),
+      sectionId: student.sectionId,
+      section: sec.label,
+      grade: sec.grade,
+      adviser: sec.adviser
+    },
+    school: {
+      full: st.schoolFull, name: st.schoolName, id: st.schoolId,
+      region: st.region, division: st.division,
+      schoolYear: st.schoolYear, principal: st.principal, order: st.order
+    },
+    scale: CR.SCALE,
+    deped: CR.DEPED,
+    subjects: subjects,
+    summary: summary,
+    targets: { term2: student.t2target || '', term3: student.t3target || '' },
+    targetOptions: TARGET_OPTIONS,
+    lastUpdated: lastUpdated,
+    builtAt: new Date().toISOString()
+  };
+}
+
+function blockGrade_(blocks, part) {
+  for (var i = 0; i < blocks.length; i++) if (blocks[i].part === part) return blocks[i].grade;
+  return null;
+}
+
+function getReport(token, fresh) {
+  try {
+    var lrn = sessionLrn_(token);
+    if (!lrn) return { ok: false, error: 'You have been signed out. Please sign in again.', code: 'auth' };
+
+    if (!fresh) {
+      var hit = cache_().get('portal.report.' + lrn);
+      if (hit) { try { var p = JSON.parse(hit); p.cached = true; return p; } catch (e) { } }
+    }
+    var rec = findStudent_(lrn);
+    if (!rec) return { ok: false, error: 'Your account is no longer on the list. Ask your class adviser.' };
+
+    var out = buildReport_(rec.values, !!fresh);
+    try {
+      var s = JSON.stringify(out);
+      if (s.length < 95000) cache_().put('portal.report.' + lrn, s, REPORT_CACHE_SECONDS);
+    } catch (e) { }
+    return out;
+  } catch (e) {
+    return { ok: false, error: said_(e) };
+  }
+}
+
+/* ---------------------------------------------------------------- teacher tools
+   Everything below is run from this editor, never from the web page. The
+   class adviser normally issues PINs from the Class Records site instead. */
+
+/**
+ * Run once after pasting in the spreadsheet ID. Checks that the portal can
+ * read the Class Records data and creates the "students" tab if needed.
+ */
+function setUpPortal() {
+  var book = ss_();
+  Logger.log('Connected to: ' + book.getName());
+  var learners = readT_('learners');
+  var records = sheet_('records') ? sheet_('records').getLastRow() - 1 : 0;
+  sheet_('students', true);
+  var accounts = readT_('students').length;
+  Logger.log('Learners on the roster: ' + learners.length);
+  Logger.log('Class records saved: ' + Math.max(0, records));
+  Logger.log('Portal accounts: ' + accounts);
+  if (!learners.length) Logger.log('WARNING: no learners yet. Upload the rosters in the Class Records site first.');
+  Logger.log('Now deploy: Deploy > New deployment > Web app > Execute as: Me > Who has access: Anyone.');
+  return { learners: learners.length, records: Math.max(0, records), accounts: accounts };
+}
+
+/**
+ * Creates a portal account with a temporary PIN for every learner who does
+ * not have one yet, in every section, and writes the PINs to a "Portal PINs"
+ * tab for printing. Safe to re-run: learners who already have an account are
+ * left alone. DELETE that tab once the slips have been handed out.
+ */
+function issuePinsForEverySection() { return issuePins_(null, false); }
+
+/** Resets the PIN of every learner in one section, e.g. issuePinsForSection('7-ADORABLE'). */
+function issuePinsForSection(sectionId) { return issuePins_(sectionId, false); }
+
+/** Resets the PIN of everyone in a section, even those who already set their own. */
+function resetPinsForSection(sectionId) { return issuePins_(sectionId, true); }
+
+function issuePins_(sectionId, reissue) {
+  return withLock_(function () {
+    var rows = readT_('students');
+    var byLrn = {}, byToken = {};
+    rows.forEach(function (s, i) { byLrn[String(s.lrn)] = i; if (s.qrToken) byToken[String(s.qrToken)] = 1; });
+    var issued = [], skipped = 0;
+    readT_('learners').forEach(function (l) {
+      if (sectionId && l.sectionId !== sectionId) return;
+      var lrn = CR.clean(l.lrn);
+      if (!lrn) { skipped++; return; }
+      var at = byLrn[lrn];
+      var was = at === undefined ? null : rows[at];
+      if (was && was.hash && !reissue) return;
+      var pin = randomPin_(), salt = randomToken_();
+      var token = (was && was.qrToken) ? String(was.qrToken) : (LEGACY_QR_TOKENS[lrn] || '');
+      while (!token) { var t = randomToken_().slice(0, 20); if (!byToken[t]) { token = t; byToken[t] = 1; } }
+      var rec = { lrn: lrn, sectionId: l.sectionId, key: l.key, name: l.name, qrToken: token,
+        hash: sha256_(pin + salt), salt: salt, mustChange: 'true', fails: '0', lockedUntil: '', lastLogin: '',
+        t2target: was ? (was.t2target || '') : '', t3target: was ? (was.t3target || '') : '' };
+      if (at === undefined) { byLrn[lrn] = rows.length; rows.push(rec); } else rows[at] = rec;
+      issued.push([l.sectionId, l.name, lrn, pin, token]);
+    });
+    if (issued.length) {
+      writeT_('students', rows);
+      var book = ss_();
+      var tab = book.getSheetByName('Portal PINs (delete after handing out)');
+      if (!tab) {
+        tab = book.insertSheet('Portal PINs (delete after handing out)');
+        tab.setFrozenRows(1);
+      }
+      tab.clear();
+      tab.getRange(1, 1, 1, 5).setValues([['Section', 'Learner', 'LRN', 'Temporary PIN', 'QR token']]).setFontWeight('bold');
+      tab.getRange(2, 1, issued.length, 5).setNumberFormat('@').setValues(issued);
+      tab.autoResizeColumns(1, 5);
+    }
+    Logger.log('Issued ' + issued.length + ' PIN(s). ' + skipped + ' learner(s) skipped for having no LRN.');
+    return { issued: issued.length, skippedNoLrn: skipped };
+  });
+}
+
+/** Puts the QR codes already printed on the 2026-2027 ID cards back on the
+    matching accounts. Run once after the first PIN issue if those cards are
+    still in use. */
+function restoreLegacyQrTokens() {
+  return withLock_(function () {
+    var rows = readT_('students'), n = 0;
+    rows.forEach(function (s) {
+      var want = LEGACY_QR_TOKENS[String(s.lrn)];
+      if (want && String(s.qrToken) !== want) { s.qrToken = want; n++; }
+    });
+    if (n) writeT_('students', rows);
+    Logger.log('Restored ' + n + ' QR token(s).');
+    return n;
+  });
+}
+
+/** Clears every cached report and session - use after a big correction. */
+function clearPortalCache() {
+  var c = cache_();
+  readT_('students').forEach(function (s) { c.remove('portal.report.' + String(s.lrn)); });
+  c.remove('portal.settings');
+  Logger.log('Portal cache cleared.');
+}
+</script>
+<script type="text/plain" id="portalIndexSrc">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<title>CANHS TSEK</title>
+<style>
+/* ===========================================================
+   CANHS TSEK - Students' Proficiency Level
+   Same visual identity as the Class Records site: navy ink on
+   paper, flag-red for what is failing, forest green for what is
+   mastered. Built for a phone first.
+   =========================================================== */
+:root{
+  --ink:#12233A; --ink-soft:#4A5C74; --ink-faint:#7C8B9F;
+  --paper:#EEF1F5; --surface:#FFFFFF;
+  --rule:#CBD4E0; --rule-strong:#9FAEC2;
+  --blue:#14497B; --blue-deep:#0C2E52; --blue-wash:#E4ECF6;
+  --red:#A8202A; --red-wash:#FBE9E9;
+  --green:#2F6B3F; --green-wash:#E7F1E8;
+  --amber:#9A6410; --amber-wash:#FBF0DC;
+  --teal:#0B5966; --teal-deep:#072F37; --teal-wash:#E1EEEF;
+  --sans:"Century Gothic","CenturyGothic","Jost","URW Gothic","Apple Gothic",Futura,"Trebuchet MS",sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:var(--sans); font-size:15.4px; line-height:1.5;
+  color:var(--ink); background:var(--paper);
+  -webkit-font-smoothing:antialiased; -webkit-text-size-adjust:100%;
+}
+button,input,select{font:inherit;color:inherit}
+h1,h2,h3{margin:0;font-weight:700;letter-spacing:.01em}
+.num{font-variant-numeric:tabular-nums}
+
+/* ---------- buttons ---------- */
+.btn{
+  appearance:none;border:1px solid var(--blue);background:var(--blue);color:#fff;
+  padding:11px 18px;border-radius:3px;font-weight:700;font-size:15px;cursor:pointer;
+  letter-spacing:.02em;
+}
+.btn:active{transform:translateY(1px)}
+.btn[disabled]{opacity:.55;cursor:default}
+.btn.wide{width:100%;display:block;padding:13px}
+.btn.ghost{background:transparent;color:var(--blue)}
+.btn.sm{padding:6px 12px;font-size:13.5px}
+.linkish{
+  background:none;border:0;padding:0;color:var(--blue);text-decoration:underline;
+  cursor:pointer;font-size:14px;
+}
+
+/* ---------- sign in ---------- */
+#gate{
+  position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;
+  padding:18px;overflow:auto;
+  background:var(--teal-deep);
+  background-image:
+    repeating-linear-gradient(0deg,rgba(255,255,255,.045) 0 1px,transparent 1px 34px),
+    repeating-linear-gradient(90deg,rgba(255,255,255,.045) 0 1px,transparent 1px 34px);
+}
+.gate-card{
+  width:100%;max-width:392px;background:var(--surface);border-radius:4px;
+  padding:26px 24px 22px;box-shadow:0 18px 46px rgba(0,0,0,.34);
+  border-top:5px solid var(--blue);
+}
+.gate-seal{
+  width:66px;height:66px;margin:0 auto 12px;border-radius:50%;
+  border:2px solid var(--blue);display:flex;align-items:center;justify-content:center;
+  color:var(--blue);font-weight:700;font-size:19px;letter-spacing:.06em;
+}
+.gate-school{text-align:center;font-weight:700;font-size:15px;line-height:1.3}
+.gate-division{text-align:center;color:var(--ink-faint);font-size:12.2px;letter-spacing:.07em;text-transform:uppercase;margin-top:3px}
+.gate-tagline{
+  text-align:center;font-size:17px;margin:14px 0 4px;color:var(--blue-deep);
+}
+.gate-sub{text-align:center;color:var(--ink-soft);font-size:13.6px;margin:0 0 18px}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12.4px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:5px;font-weight:700}
+.field input{
+  width:100%;padding:12px 12px;border:1px solid var(--rule-strong);border-radius:3px;
+  background:#fff;font-size:17px;
+}
+.field input:focus{outline:2px solid var(--blue);outline-offset:-1px;border-color:var(--blue)}
+.pinin{letter-spacing:.42em;text-align:center;font-size:21px !important}
+.gate-or{
+  text-align:center;color:var(--ink-faint);font-size:12.4px;margin:14px 0;
+  display:flex;align-items:center;gap:10px;
+}
+.gate-or::before,.gate-or::after{content:"";flex:1;height:1px;background:var(--rule)}
+.gate-note{margin-top:16px;font-size:12.6px;color:var(--ink-faint);text-align:center;line-height:1.5}
+#gateErr,#pinErr{
+  margin-top:12px;padding:10px 12px;border-radius:3px;font-size:14px;
+  background:var(--red-wash);color:var(--red);border:1px solid #E7BFC2;
+}
+#gateErr:empty,#pinErr:empty{display:none}
+.gate-ok{background:var(--green-wash) !important;color:var(--green) !important;border-color:#BEDAC4 !important}
+
+/* camera */
+#scanWrap{margin-top:14px}
+#scanWrap[hidden]{display:none}
+#scanVideo{width:100%;border-radius:3px;background:#000;aspect-ratio:4/3;object-fit:cover}
+.scan-hint{font-size:12.8px;color:var(--ink-soft);text-align:center;margin-top:8px}
+
+/* ---------- app shell ---------- */
+#app{display:none}
+#app.on{display:block}
+.topbar{
+  background:var(--blue-deep);color:#fff;padding:12px 16px;
+  display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:20;
+}
+.topbar .seal{
+  width:38px;height:38px;border-radius:50%;border:1.5px solid rgba(255,255,255,.7);
+  display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:700;letter-spacing:.04em;flex:0 0 auto;
+}
+.topbar .t{min-width:0;flex:1}
+.topbar .dept{font-size:10.4px;letter-spacing:.08em;text-transform:uppercase;opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar .school{font-size:14.4px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar button{
+  background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.3);color:#fff;
+  padding:7px 11px;border-radius:3px;font-size:13px;cursor:pointer;flex:0 0 auto;
+}
+.wrap{max-width:900px;margin:0 auto;padding:16px 14px 52px}
+
+/* identity card */
+.idcard{
+  background:var(--surface);border:1px solid var(--rule);border-top:4px solid var(--blue);
+  border-radius:3px;padding:15px 16px;margin-bottom:14px;
+}
+.idcard h1{font-size:20px;line-height:1.25}
+.idmeta{
+  display:flex;flex-wrap:wrap;gap:4px 18px;margin-top:8px;
+  font-size:13.4px;color:var(--ink-soft);
+}
+.idmeta b{color:var(--ink);font-weight:700}
+.idactions{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+
+/* term tabs */
+.terms{display:flex;gap:6px;margin-bottom:14px;overflow-x:auto;padding-bottom:2px}
+.terms button{
+  flex:1 0 auto;min-width:84px;padding:10px 12px;border:1px solid var(--rule-strong);
+  background:var(--surface);border-radius:3px;font-weight:700;font-size:14px;cursor:pointer;
+  color:var(--ink-soft);
+}
+.terms button.on{background:var(--blue);border-color:var(--blue);color:#fff}
+.terms button .g{display:block;font-size:11.4px;font-weight:400;opacity:.85;margin-top:1px}
+
+/* summary */
+.summary{
+  background:var(--surface);border:1px solid var(--rule);border-radius:3px;
+  padding:16px;margin-bottom:14px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+}
+.summary .big{font-size:42px;font-weight:700;line-height:1.05;letter-spacing:-.01em;margin-top:2px}
+.summary .lab{font-size:11.6px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-faint);font-weight:700}
+.summary .col{flex:1;min-width:150px}
+.chip{
+  display:inline-block;padding:4px 11px;border-radius:999px;font-size:12.6px;font-weight:700;
+  border:1px solid currentColor;
+}
+.chip.honor{color:var(--green);background:var(--green-wash)}
+.chip.none{color:var(--ink-faint);background:var(--paper);font-weight:400}
+.lv-A{color:var(--green);background:var(--green-wash)}
+.lv-B{color:var(--blue);background:var(--blue-wash)}
+.lv-C{color:var(--teal);background:var(--teal-wash)}
+.lv-D{color:var(--amber);background:var(--amber-wash)}
+.lv-E{color:var(--red);background:var(--red-wash)}
+
+/* subject list */
+.panel{
+  background:var(--surface);border:1px solid var(--rule);border-radius:3px;margin-bottom:14px;overflow:hidden;
+}
+.panel > h3{
+  padding:11px 16px;border-bottom:1px solid var(--rule);font-size:13px;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--ink-soft);background:#F7F9FB;
+}
+.subj{border-bottom:1px solid var(--rule)}
+.subj:last-child{border-bottom:0}
+.subj-head{
+  width:100%;display:flex;align-items:center;gap:12px;padding:13px 16px;
+  background:none;border:0;text-align:left;cursor:pointer;
+}
+.subj-head:hover{background:#F7F9FB}
+.subj-name{flex:1;min-width:0}
+.subj-name .n{display:block;font-weight:700;font-size:15.4px;line-height:1.25}
+.subj-name .t{display:block;font-size:12.4px;color:var(--ink-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.02em}
+.subj-grade{font-size:26px;font-weight:700;min-width:54px;text-align:right;line-height:1}
+.subj-grade .dash{color:var(--rule-strong);font-size:22px}
+.caret{color:var(--ink-faint);font-size:13px;width:14px;text-align:center;transition:transform .15s}
+.subj.open .caret{transform:rotate(90deg)}
+.bar{display:block;height:5px;border-radius:3px;background:var(--paper);overflow:hidden;margin-top:7px;max-width:260px}
+.bar i{display:block;height:100%;background:currentColor;border-radius:3px}
+.subj-body{display:none;padding:4px 16px 18px;background:#FBFCFD;border-top:1px dashed var(--rule)}
+.subj.open .subj-body{display:block}
+
+/* component tables */
+.comp{margin-top:14px}
+.comp h4{
+  margin:0 0 6px;font-size:12.4px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--blue);font-weight:700;display:flex;justify-content:space-between;gap:10px;align-items:baseline;
+}
+.comp h4 span{color:var(--ink-faint);font-weight:400;letter-spacing:0;text-transform:none;font-size:12.4px}
+table.grid{width:100%;border-collapse:collapse;font-size:13.4px}
+table.grid th,table.grid td{border:1px solid var(--rule);padding:6px 8px;text-align:left;vertical-align:top}
+table.grid th{background:#F2F5F9;font-size:11.4px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-soft);font-weight:700}
+table.grid td.n,table.grid th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+table.grid tr.tot td{background:#F7F9FB;font-weight:700}
+table.grid td.miss{color:var(--ink-faint)}
+.d{font-size:11.8px;color:var(--ink-faint);display:block}
+.partlab{
+  margin:16px 0 0;font-size:12.6px;font-weight:700;color:var(--teal);
+  letter-spacing:.06em;text-transform:uppercase;border-top:2px solid var(--teal-wash);padding-top:10px;
+}
+.finalrow{
+  margin-top:14px;padding:11px 12px;border:1px solid var(--rule-strong);border-radius:3px;background:#fff;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.finalrow .k{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-faint);font-weight:700}
+.finalrow .v{font-size:19px;font-weight:700}
+.note{padding:11px 13px;border-radius:3px;font-size:13.6px;margin:12px 0}
+.note.info{background:var(--blue-wash);color:var(--blue-deep)}
+.note.warn{background:var(--amber-wash);color:var(--amber)}
+.note.bad{background:var(--red-wash);color:var(--red)}
+.empty{padding:26px 16px;text-align:center;color:var(--ink-faint);font-size:14px}
+
+/* targets */
+.target-row{display:flex;gap:12px;flex-wrap:wrap;padding:14px 16px}
+.target-row .f{flex:1;min-width:200px}
+.target-row label{display:block;font-size:11.8px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-soft);font-weight:700;margin-bottom:5px}
+.target-row select{width:100%;padding:10px;border:1px solid var(--rule-strong);border-radius:3px;background:#fff}
+.target-foot{padding:0 16px 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+
+/* scale legend */
+.legend{display:flex;flex-wrap:wrap;gap:8px;padding:14px 16px}
+.legend span{font-size:12.4px;padding:4px 10px;border-radius:999px;border:1px solid currentColor}
+
+.toast{
+  position:fixed;left:50%;bottom:20px;transform:translateX(-50%);
+  background:var(--ink);color:#fff;padding:11px 18px;border-radius:3px;font-size:14px;
+  z-index:80;max-width:90vw;box-shadow:0 8px 24px rgba(0,0,0,.28);
+}
+.toast.bad{background:var(--red)}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+
+@media (max-width:520px){
+  .summary .big{font-size:36px}
+  .subj-grade{font-size:23px;min-width:46px}
+  table.grid{font-size:12.6px}
+  table.grid th,table.grid td{padding:5px 6px}
+}
+
+@media print{
+  #gate,.topbar,.idactions,.terms,.target-row,.target-foot,.no-print{display:none !important}
+  body{background:#fff}
+  .wrap{max-width:none;padding:0}
+  .panel,.summary,.idcard{border:1px solid #999;break-inside:avoid}
+  .subj-body{display:block !important;background:#fff}
+  .caret{display:none}
+  a[href]:after{content:""}
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================================ sign in -->
+<div id="gate">
+  <div class="gate-card">
+    <div class="gate-seal">CANHS</div>
+    <div class="gate-school" id="gSchool">Castor Alviar National High School</div>
+    <div class="gate-division" id="gDivision">Division of Calamba City</div>
+
+    <div id="stepLogin">
+      <h1 class="gate-tagline">CANHS TSEK</h1>
+      <p class="gate-sub" id="gTagline">Check your own proficiency level</p>
+      <div class="field">
+        <label for="lrn">Your LRN</label>
+        <input id="lrn" inputmode="numeric" autocomplete="username" spellcheck="false" placeholder="12 digits on your report card">
+      </div>
+      <div class="field">
+        <label for="pin">Your PIN</label>
+        <input id="pin" class="pinin" type="password" inputmode="numeric" autocomplete="current-password" maxlength="8" placeholder="••••••">
+      </div>
+      <button class="btn wide" id="signinBtn">Sign in</button>
+      <div class="gate-or">or</div>
+      <button class="btn wide ghost" id="scanBtn">Scan the QR code on my ID</button>
+      <div id="scanWrap" hidden>
+        <video id="scanVideo" playsinline muted></video>
+        <div class="scan-hint">Hold your ID card steady inside the frame. <button class="linkish" id="scanStop">Stop</button></div>
+      </div>
+      <div id="gateErr" role="alert"></div>
+      <div class="gate-note">
+        Your PIN is yours alone - not even your teacher can see it.<br>
+        Forgot it? Ask your class adviser to issue a new one.
+      </div>
+    </div>
+
+    <div id="stepPin" hidden>
+      <h1 class="gate-tagline">Choose your own PIN</h1>
+      <p class="gate-sub">This is your first sign-in. Pick a number only you know, then keep it secret.</p>
+      <div class="field">
+        <label for="oldPin">The PIN your adviser gave you</label>
+        <input id="oldPin" class="pinin" type="password" inputmode="numeric" maxlength="8">
+      </div>
+      <div class="field">
+        <label for="newPin">Your new PIN</label>
+        <input id="newPin" class="pinin" type="password" inputmode="numeric" maxlength="8" placeholder="6 digits">
+      </div>
+      <div class="field">
+        <label for="newPin2">Type your new PIN again</label>
+        <input id="newPin2" class="pinin" type="password" inputmode="numeric" maxlength="8">
+      </div>
+      <button class="btn wide" id="savePinBtn">Save my PIN</button>
+      <div id="pinErr" role="alert"></div>
+      <div class="gate-note">Do not use your birthday or 123456. Nobody can recover this PIN for you - a forgotten PIN has to be replaced by your adviser.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ app -->
+<div id="app">
+  <div class="topbar">
+    <div class="seal">CANHS</div>
+    <div class="t">
+      <div class="dept">Department of Education &middot; Region IV-A &middot; <span id="tbDivision">Calamba City</span></div>
+      <div class="school" id="tbSchool">Castor Alviar National High School</div>
+    </div>
+    <button id="signout">Sign out</button>
+  </div>
+  <div class="wrap" id="main"></div>
+</div>
+
+<script>
+/* ====================================================================
+   CANHS TSEK - Students' Proficiency Level
+   Reads straight from the school's Class Records data through the
+   server script, so what a learner sees here is what the class record
+   says, computed by the very same rules.
+   ==================================================================== */
+
+var TOKEN = '';
+var REP = null;
+var VIEW = '1';
+var OPEN = {};
+
+var $ = function (s, r) { return (r || document).querySelector(s); };
+var esc = function (s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; });
+};
+var fmt2 = function (v) { return (v === null || v === undefined || v === '') ? '' : (Math.round(v * 100) / 100).toFixed(2); };
+var whole = function (v) { return (v === null || v === undefined || v === '') ? '' : String(Math.round(v)); };
+
+function toast(msg, bad) {
+  var t = document.createElement('div');
+  t.className = 'toast' + (bad ? ' bad' : '');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(function () { t.remove(); }, bad ? 6000 : 3000);
+}
+function busy(btn, on, label) {
+  if (!btn) return;
+  if (on) { btn.dataset.lab = btn.textContent; btn.innerHTML = '<span class="spin"></span> ' + (label || 'Please wait'); btn.disabled = true; }
+  else { btn.textContent = btn.dataset.lab || btn.textContent; btn.disabled = false; }
+}
+
+/* google.script.run as a promise */
+function call(fn) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function (resolve, reject) {
+    google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(function (e) { reject(new Error(e && e.message ? e.message : 'The school server did not answer. Try again.')); })
+      [fn].apply(null, args);
+  });
+}
+
+/* remember the sign-in on this device for the session only */
+var Keep = {
+  get: function (k) { try { return sessionStorage.getItem('tsek.' + k); } catch (e) { return null; } },
+  set: function (k, v) { try { sessionStorage.setItem('tsek.' + k, v); } catch (e) { } },
+  del: function (k) { try { sessionStorage.removeItem('tsek.' + k); } catch (e) { } }
+};
+
+/* ------------------------------------------------------------ start */
+document.addEventListener('DOMContentLoaded', function () {
+  call('portalConfig').then(function (c) {
+    if (!c || !c.ok) return;
+    $('#gSchool').textContent = c.schoolFull || 'Castor Alviar National High School';
+    $('#gDivision').textContent = 'Division of ' + (c.division || 'Calamba City');
+    $('#tbDivision').textContent = c.division || 'Calamba City';
+    $('#tbSchool').textContent = c.schoolFull || 'Castor Alviar National High School';
+    $('#gTagline').textContent = (c.subtitle || "Students' Proficiency Level") + ' · S.Y. ' + (c.schoolYear || '');
+    $('#newPin').placeholder = (c.minPin || 6) + ' digits';
+    document.title = c.title || 'CANHS TSEK';
+  }).catch(function () { });
+
+  var t = Keep.get('token');
+  if (t) { TOKEN = t; openApp(true); }
+
+  $('#signinBtn').addEventListener('click', doLogin);
+  $('#pin').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+  $('#lrn').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('#pin').focus(); });
+  $('#lrn').addEventListener('focus', function () {
+    if (!$('#lrn').readOnly) return;
+    SCANNED = ''; $('#lrn').readOnly = false; $('#lrn').value = '';
+    $('#gateErr').className = ''; $('#gateErr').textContent = '';
+  });
+  $('#savePinBtn').addEventListener('click', doSetPin);
+  $('#newPin2').addEventListener('keydown', function (e) { if (e.key === 'Enter') doSetPin(); });
+  $('#scanBtn').addEventListener('click', startScan);
+  $('#scanStop').addEventListener('click', stopScan);
+  $('#signout').addEventListener('click', doSignOut);
+});
+
+/* ------------------------------------------------------------ sign in */
+var SCANNED = '';
+
+function doLogin() {
+  var id = SCANNED || $('#lrn').value.trim();
+  var pin = $('#pin').value.trim();
+  $('#gateErr').className = '';
+  if (!id) { $('#gateErr').textContent = 'Type your LRN, or scan the QR code on your ID.'; return; }
+  if (!pin) { $('#gateErr').textContent = 'Type your PIN.'; return; }
+  $('#gateErr').textContent = '';
+  busy($('#signinBtn'), true, 'Signing in');
+  call('login', id, pin).then(function (r) {
+    busy($('#signinBtn'), false);
+    if (!r.ok) { SCANNED = ''; $('#gateErr').textContent = r.error; return; }
+    TOKEN = r.token;
+    Keep.set('token', TOKEN);
+    $('#pin').value = '';
+    if (r.mustChangePin) {
+      $('#oldPin').value = pin;
+      $('#stepLogin').hidden = true;
+      $('#stepPin').hidden = false;
+      $('#newPin').focus();
+      return;
+    }
+    openApp();
+  }).catch(function (e) {
+    busy($('#signinBtn'), false);
+    $('#gateErr').textContent = e.message;
+  });
+}
+
+function doSetPin() {
+  var oldPin = $('#oldPin').value.trim(), a = $('#newPin').value.trim(), b = $('#newPin2').value.trim();
+  $('#pinErr').className = '';
+  if (a !== b) { $('#pinErr').textContent = 'The two new PINs are not the same.'; return; }
+  busy($('#savePinBtn'), true, 'Saving');
+  call('changePin', TOKEN, oldPin, a).then(function (r) {
+    busy($('#savePinBtn'), false);
+    if (!r.ok) { $('#pinErr').textContent = r.error; if (r.code === 'auth') backToLogin(); return; }
+    $('#oldPin').value = $('#newPin').value = $('#newPin2').value = '';
+    openApp();
+    toast('Your PIN is set. Keep it to yourself.');
+  }).catch(function (e) { busy($('#savePinBtn'), false); $('#pinErr').textContent = e.message; });
+}
+
+function backToLogin(msg) {
+  TOKEN = ''; REP = null; SCANNED = '';
+  Keep.del('token');
+  $('#app').classList.remove('on');
+  $('#gate').style.display = '';
+  $('#stepPin').hidden = true;
+  $('#stepLogin').hidden = false;
+  $('#gateErr').className = '';
+  $('#gateErr').textContent = msg || '';
+}
+
+function doSignOut() {
+  var t = TOKEN;
+  backToLogin();
+  if (t) call('logout', t).catch(function () { });
+}
+
+/* ------------------------------------------------------------ QR scanning */
+var scanStream = null, scanTimer = null, jsQRReady = null;
+
+function loadJsQR() {
+  if (jsQRReady) return jsQRReady;
+  jsQRReady = new Promise(function (resolve, reject) {
+    if (window.jsQR) return resolve(window.jsQR);
+    var s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js';
+    s.onload = function () { resolve(window.jsQR); };
+    s.onerror = function () { reject(new Error('no-lib')); };
+    document.head.appendChild(s);
+  });
+  return jsQRReady;
+}
+
+function startScan() {
+  $('#gateErr').className = '';
+  $('#gateErr').textContent = '';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $('#gateErr').textContent = 'This browser cannot open the camera. Type your LRN instead.';
+    return;
+  }
+  var video = $('#scanVideo');
+  var canvas = document.createElement('canvas');
+  var ctx = canvas.getContext('2d', { willReadFrequently: true });
+  var detector = null;
+  if (window.BarcodeDetector) { try { detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch (e) { detector = null; } }
+
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }).then(function (stream) {
+    scanStream = stream;
+    video.srcObject = stream;
+    video.play();
+    $('#scanWrap').hidden = false;
+    $('#scanBtn').hidden = true;
+    return detector ? null : loadJsQR().catch(function () { return null; });
+  }).then(function (lib) {
+    var jsq = window.jsQR || null;
+    scanTimer = setInterval(function () {
+      if (!video.videoWidth) return;
+      if (detector) {
+        detector.detect(video).then(function (codes) { if (codes && codes.length) gotCode(codes[0].rawValue); }).catch(function () { });
+        return;
+      }
+      if (!jsq) return;
+      canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      var img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      var code = jsq(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+      if (code && code.data) gotCode(code.data);
+    }, 260);
+    if (!detector && !jsq) {
+      stopScan();
+      $('#gateErr').textContent = 'The scanner could not load. Type your LRN instead.';
+    }
+  }).catch(function () {
+    stopScan();
+    $('#gateErr').textContent = 'The camera could not be opened. Allow camera access, or type your LRN instead.';
+  });
+}
+
+function gotCode(raw) {
+  var v = String(raw || '').trim();
+  if (!v) return;
+  stopScan();
+  SCANNED = v;
+  $('#lrn').value = v.length > 14 ? 'ID card scanned ✓' : v;
+  $('#lrn').readOnly = v.length > 14;
+  $('#gateErr').className = 'gate-ok';
+  $('#gateErr').textContent = 'ID card read. Now type your PIN.';
+  $('#pin').focus();
+}
+
+function stopScan() {
+  if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
+  if (scanStream) { scanStream.getTracks().forEach(function (t) { t.stop(); }); scanStream = null; }
+  $('#scanWrap').hidden = true;
+  $('#scanBtn').hidden = false;
+}
+
+/* ------------------------------------------------------------ report */
+function openApp(silent) {
+  $('#gate').style.display = 'none';
+  $('#app').classList.add('on');
+  $('#main').innerHTML = '<div class="empty">Opening your class records…</div>';
+  loadReport(false).catch(function (e) {
+    if (silent) backToLogin('');
+    else $('#main').innerHTML = '<div class="note bad">' + esc(e.message) + '</div>';
+  });
+}
+
+function loadReport(fresh) {
+  return call('getReport', TOKEN, !!fresh).then(function (r) {
+    if (!r.ok) {
+      if (r.code === 'auth') { backToLogin('Your sign-in has expired. Please sign in again.'); throw new Error(r.error); }
+      throw new Error(r.error);
+    }
+    REP = r;
+    if (!VIEWchosen) { VIEW = latestTerm(r); VIEWchosen = true; }
+    draw();
+    return r;
+  });
+}
+var VIEWchosen = false;
+
+function latestTerm(r) {
+  var last = '1';
+  ['1', '2', '3'].forEach(function (t) { if (r.summary[t] && r.summary[t].graded) last = t; });
+  return last;
+}
+
+function levelClass(label) {
+  return { 'Advancing': 'lv-A', 'Benchmarking': 'lv-B', 'Connecting': 'lv-C', 'Developing': 'lv-D', 'Emerging': 'lv-E' }[label] || 'none';
+}
+function gradeColor(g) {
+  if (g === null || g === undefined) return 'var(--rule-strong)';
+  if (g >= 90) return 'var(--green)';
+  if (g >= 80) return 'var(--blue)';
+  if (g >= 75) return 'var(--teal)';
+  if (g >= 65) return 'var(--amber)';
+  return 'var(--red)';
+}
+
+function draw() {
+  var r = REP, s = r.student;
+  var termBtn = function (k, label) {
+    var sm = r.summary[k] || {};
+    var g = sm.average === null || sm.average === undefined ? '' : fmt2(sm.average);
+    return '<button data-term="' + k + '" class="' + (VIEW === k ? 'on' : '') + '">' + label +
+      '<span class="g">' + (g ? g : 'no grades yet') + '</span></button>';
+  };
+
+  var html = '';
+  html += '<div class="idcard">' +
+    '<h1>' + esc(s.name) + '</h1>' +
+    '<div class="idmeta">' +
+      '<span>LRN <b>' + esc(s.lrn) + '</b></span>' +
+      '<span>Section <b>' + esc(s.section) + '</b></span>' +
+      (s.adviser ? '<span>Adviser <b>' + esc(s.adviser) + '</b></span>' : '') +
+      '<span>S.Y. <b>' + esc(r.school.schoolYear) + '</b></span>' +
+    '</div>' +
+    '<div class="idactions no-print">' +
+      '<button class="btn sm" id="refreshBtn">Refresh</button>' +
+      '<button class="btn sm ghost" id="printBtn">Print / Save as PDF</button>' +
+    '</div>' +
+    (r.lastUpdated ? '<div class="d" style="margin-top:9px">Class records last updated ' + esc(niceDate(r.lastUpdated)) + '.</div>' : '') +
+  '</div>';
+
+  html += '<div class="terms no-print">' + termBtn('1', 'Term 1') + termBtn('2', 'Term 2') + termBtn('3', 'Term 3') + termBtn('final', 'Final') + '</div>';
+
+  html += drawSummary();
+  html += drawSubjects();
+  if (VIEW === '2' || VIEW === '3') html += drawTargets();
+  html += drawLegend();
+  html += '<div class="note info no-print">These are the grades in your teachers’ class records right now. A term is only complete once the term examination has been recorded and your department head has checked it. If something looks wrong, tell your subject teacher or class adviser.</div>';
+
+  $('#main').innerHTML = html;
+
+  var rb = $('#refreshBtn');
+  if (rb) rb.addEventListener('click', function () {
+    busy(rb, true, 'Refreshing');
+    loadReport(true).then(function () { toast('Up to date.'); }).catch(function (e) { busy(rb, false); toast(e.message, true); });
+  });
+  var pb = $('#printBtn');
+  if (pb) pb.addEventListener('click', function () { window.print(); });
+
+  Array.prototype.forEach.call(document.querySelectorAll('[data-term]'), function (b) {
+    b.addEventListener('click', function () { VIEW = b.getAttribute('data-term'); draw(); });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.subj-head'), function (b) {
+    b.addEventListener('click', function () {
+      var code = b.getAttribute('data-code');
+      OPEN[code] = !OPEN[code];
+      b.parentNode.classList.toggle('open', !!OPEN[code]);
+      b.setAttribute('aria-expanded', OPEN[code] ? 'true' : 'false');
+    });
+  });
+  var tb = $('#saveTargets');
+  if (tb) tb.addEventListener('click', saveTargets);
+}
+
+function niceDate(iso) {
+  try {
+    var d = new Date(iso);
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) + ', ' +
+      d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  } catch (e) { return iso; }
+}
+
+function drawSummary() {
+  var sm = REP.summary[VIEW] || {};
+  var label = VIEW === 'final' ? 'Final general average' : 'Term ' + VIEW + ' general average';
+  var avg = sm.average;
+  var lv = sm.band && sm.band.level ? sm.band.level : '';
+  var out = '<div class="summary">';
+  out += '<div><div class="lab">' + esc(label) + '</div>' +
+    '<div class="big" style="color:' + gradeColor(avg === null ? null : Math.round(avg)) + '">' + (avg === null || avg === undefined ? '—' : fmt2(avg)) + '</div></div>';
+  out += '<div class="col">';
+  if (avg === null || avg === undefined) {
+    out += '<div class="d" style="font-size:13.4px">No learning area has a finished grade for this period yet.</div>';
+  } else {
+    out += '<span class="chip ' + levelClass(lv) + '">' + esc(lv) + '</span> ';
+    out += sm.honor ? '<span class="chip honor">' + esc(sm.honor) + '</span>' : '<span class="chip none">No honour bracket yet</span>';
+    out += '<div class="d" style="margin-top:8px;font-size:12.8px">Averaged over ' + sm.graded + ' of ' + sm.of + ' learning areas' +
+      (sm.graded < sm.of ? ' · the rest are not finished' : '') + '. Rounded: <b>' + whole(avg) + '</b>.</div>';
+  }
+  out += '</div></div>';
+  return out;
+}
+
+function drawSubjects() {
+  var out = '<div class="panel"><h3>' + (VIEW === 'final' ? 'Final rating per learning area' : 'Term ' + VIEW + ' · learning areas') + '</h3>';
+  REP.subjects.forEach(function (s) {
+    var g, band, block;
+    if (VIEW === 'final') { g = s.final; band = s.finalBand; block = null; }
+    else { block = s.terms[VIEW]; g = block ? block.grade : null; band = block ? block.band : null; }
+    var col = gradeColor(g);
+    out += '<div class="subj' + (OPEN[s.code] ? ' open' : '') + '">';
+    out += '<button class="subj-head" data-code="' + esc(s.code) + '" aria-expanded="' + (OPEN[s.code] ? 'true' : 'false') + '">' +
+      '<span class="subj-name"><span class="n">' + esc(s.label) + '</span>' +
+      '<span class="t">' + (s.teacher ? esc(s.teacher) : '&nbsp;') + '</span>' +
+      '<span class="bar" style="color:' + col + '"><i style="width:' + (g === null || g === undefined ? 0 : Math.max(0, Math.min(100, (g - 55) / 45 * 100))) + '%"></i></span></span>' +
+      '<span class="subj-grade" style="color:' + col + '">' + (g === null || g === undefined ? '<span class="dash">—</span>' : whole(g)) + '</span>' +
+      '<span class="caret">&#9656;</span></button>';
+    out += '<div class="subj-body">' + (VIEW === 'final' ? finalBody(s) : termBody(s, block, band)) + '</div>';
+    out += '</div>';
+  });
+  out += '</div>';
+  return out;
+}
+
+function finalBody(s) {
+  var out = '<table class="grid" style="margin-top:12px"><thead><tr><th>Period</th><th class="n">Grade</th><th>Proficiency level</th></tr></thead><tbody>';
+  ['1', '2', '3'].forEach(function (t, i) {
+    var b = s.terms[t];
+    var g = b ? b.grade : null;
+    out += '<tr><td>Term ' + t + '</td><td class="n">' + (g === null || g === undefined ? '<span class="miss">—</span>' : whole(g)) + '</td>' +
+      '<td>' + (b && b.band && b.band.level ? esc(b.band.level) : '<span class="miss">not finished</span>') + '</td></tr>';
+  });
+  out += '</tbody></table>';
+  if (s.final === null || s.final === undefined) {
+    out += '<div class="note warn">The final rating is worked out only once all three terms have a grade.</div>';
+  } else {
+    out += '<div class="finalrow"><span class="k">Final rating</span><span class="v">' + whole(s.final) + '</span>' +
+      '<span class="chip ' + levelClass(s.finalBand.level) + '">' + esc(s.finalBand.level) + '</span>' +
+      '<span class="d" style="display:inline">' + esc(s.finalBand.deped) + ' (DepEd)</span></div>';
+  }
+  return out;
+}
+
+function termBody(s, block, band) {
+  if (!block) return '<div class="note warn">Your teacher has not started this term in the class record yet.</div>';
+  var out = '';
+  var multi = block.parts.length > 1;
+  block.parts.forEach(function (p) {
+    if (multi) out += '<div class="partlab">' + esc(p.label || p.part) + '</div>';
+    if (!p.detail) {
+      out += '<div class="note info">Only the grade was saved for this part of the term: <b>' + whole(p.grade) + '</b>.</div>';
+      return;
+    }
+    out += compTable('Written Work', p.ww, p.weights ? p.weights[0] : null);
+    out += compTable('Performance Tasks', p.pt, p.weights ? p.weights[1] : null);
+    out += compTable('Summative / Term Examination', p.st, p.weights ? p.weights[2] : null, true);
+    out += '<div class="finalrow">' +
+      '<span><span class="k">Initial grade</span><br><span class="v">' + (p.initial === null ? '—' : fmt2(p.initial)) + '</span></span>' +
+      '<span><span class="k">' + (multi ? esc(p.label) + ' grade' : 'Term grade') + '</span><br><span class="v" style="color:' + gradeColor(p.grade) + '">' + (p.grade === null ? '—' : whole(p.grade)) + '</span></span>' +
+      (p.grade === null ? '<span class="d" style="display:inline">the grade appears once the term examination is recorded</span>' : '') +
+      '</div>';
+  });
+  if (multi) {
+    out += '<div class="finalrow" style="border-color:var(--blue);background:var(--blue-wash)">' +
+      '<span class="k">MAPEH term grade</span>' +
+      '<span class="v" style="color:' + gradeColor(block.grade) + '">' + (block.grade === null ? '—' : whole(block.grade)) + '</span>' +
+      '<span class="d" style="display:inline">the average of Music and Arts and PE and Health, rounded</span></div>';
+  }
+  if (band && band.level) {
+    out += '<div class="note info" style="margin-top:12px">Proficiency level <b>' + esc(band.level) + '</b> (' + esc(band.range) + ') · DepEd descriptor <b>' + esc(band.deped) + '</b>.</div>';
+  }
+  out += '<div class="d" style="margin-top:10px">' +
+    (block.checked ? 'Checked by the department head.' : 'Not yet checked by the department head - the grade may still change.') + '</div>';
+  return out;
+}
+
+var FALLBACK_NAME = { 'Written Work': 'Quiz', 'Performance Tasks': 'Performance Task' };
+function compTable(title, c, weightPct, isSt) {
+  if (!c) return '';
+  var rows = c.items || [];
+  var out = '<div class="comp"><h4>' + esc(title) +
+    (weightPct ? '<span>' + fmt2(weightPct).replace(/\.00$/, '') + '% of the grade</span>' : '') + '</h4>';
+  if (!rows.length) return out + '<div class="d">Nothing recorded yet.</div></div>';
+  out += '<table class="grid"><thead><tr><th style="width:44%">' + (isSt ? 'Assessment' : 'Activity') + '</th><th class="n">Score</th><th class="n">Over</th><th class="n">%</th></tr></thead><tbody>';
+  rows.forEach(function (it) {
+    var name = it.desc || (isSt ? ['Summative 1', 'Summative 2', 'Term Examination'][it.n - 1]
+      : (FALLBACK_NAME[title] || 'Item') + ' ' + it.n) || ('Item ' + it.n);
+    out += '<tr>' +
+      '<td>' + esc(name) + (it.date ? '<span class="d">' + esc(it.date) + '</span>' : '') + '</td>' +
+      '<td class="n' + (it.score === null ? ' miss' : '') + '">' + (it.score === null ? '—' : it.score) + '</td>' +
+      '<td class="n">' + (it.hps === null ? '—' : it.hps) + '</td>' +
+      '<td class="n' + (it.pct === null ? ' miss' : '') + '">' + (it.pct === null ? '—' : it.pct) + '</td>' +
+      '</tr>';
+  });
+  if (c.total !== null && c.total !== undefined) {
+    out += '<tr class="tot"><td>Total</td><td class="n">' + fmt2(c.total).replace(/\.00$/, '') + '</td>' +
+      '<td class="n">' + (c.hps === null ? '—' : c.hps) + '</td>' +
+      '<td class="n">' + (c.ps === null ? '—' : fmt2(c.ps)) + '</td></tr>';
+  } else {
+    out += '<tr class="tot"><td>Percentage score</td><td class="n" colspan="3">' + (c.ps === null ? '—' : fmt2(c.ps)) + '</td></tr>';
+  }
+  out += '<tr class="tot"><td>Weighted score</td><td class="n" colspan="3">' + (c.ws === null ? '—' : fmt2(c.ws)) + '</td></tr>';
+  out += '</tbody></table></div>';
+  return out;
+}
+
+/* ------------------------------------------------------------ targets */
+function drawTargets() {
+  var t = REP.targets || {};
+  var opts = function (sel) {
+    return '<option value="">No goal set</option>' + REP.targetOptions.map(function (o) {
+      return '<option value="' + esc(o) + '"' + (o === sel ? ' selected' : '') + '>' + esc(o) + '</option>';
+    }).join('');
+  };
+  return '<div class="panel no-print"><h3>My goal</h3>' +
+    '<div class="target-row">' +
+      '<div class="f"><label for="t2">By the end of Term 2 I want to be</label><select id="t2">' + opts(t.term2) + '</select></div>' +
+      '<div class="f"><label for="t3">By the end of Term 3 I want to be</label><select id="t3">' + opts(t.term3) + '</select></div>' +
+    '</div>' +
+    '<div class="target-foot"><button class="btn sm" id="saveTargets">Save my goal</button>' +
+    '<span class="d">Only you and your class adviser can see this. With Honors needs an average of 90, With High Honors 95, With Highest Honors 98.</span></div></div>';
+}
+
+function saveTargets() {
+  var b = $('#saveTargets');
+  busy(b, true, 'Saving');
+  call('saveTargets', TOKEN, $('#t2').value, $('#t3').value).then(function (r) {
+    busy(b, false);
+    if (!r.ok) { toast(r.error, true); if (r.code === 'auth') backToLogin('Your sign-in has expired. Please sign in again.'); return; }
+    REP.targets = r.targets;
+    toast('Goal saved. Now go and get it.');
+  }).catch(function (e) { busy(b, false); toast(e.message, true); });
+}
+
+/* ------------------------------------------------------------ legend */
+function drawLegend() {
+  var out = '<div class="panel"><h3>How to read these numbers</h3><div class="legend">';
+  (REP.scale || []).forEach(function (b) {
+    out += '<span class="' + levelClass(b.label) + '">' + esc(b.label) + ' · ' + esc(b.range) + '</span>';
+  });
+  out += '</div><div class="legend" style="padding-top:0">';
+  (REP.deped || []).forEach(function (b) {
+    out += '<span style="color:var(--ink-faint)">' + esc(b.label) + ' · ' + esc(b.range) + '</span>';
+  });
+  out += '</div></div>';
+  return out;
+}
+<\/script>
+</body>
+</html>
 </script>
 <script>
 /* ====================================================================
@@ -3182,13 +5687,13 @@ const DemoDB = (() => {
   const load = () => {
     if (db) return db;
     try { db = JSON.parse(LS.get(KEY) || 'null'); } catch (e) { db = null; }
-    if (!db) db = { settings: [], teachers: [], assignments: [], checkers: [], learners: [], sessions: [], log: [], records: [] };
+    if (!db) db = { settings: [], teachers: [], assignments: [], checkers: [], learners: [], students: [], sessions: [], log: [], records: [] };
     return db;
   };
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { toast('Demo storage is full in this browser.', true); } };
   const copy = x => JSON.parse(JSON.stringify(x));
   return {
-    read: t => copy(load()[t] || []),
+    read: t => copy(load()[t] || (load()[t] = [])),
     write: (t, rows) => { load()[t] = copy(rows); save(); },
     append: (t, row) => { const d = load(); d[t].push(copy(row)); if (t === 'log' && d.log.length > 500) d.log.splice(0, d.log.length - 500); save(); },
     recordMeta: () => load().records.map(r => { const o = Object.assign({}, r); delete o.data; delete o.grades; return o; }),
@@ -3448,6 +5953,10 @@ const NAV = () => {
     items.push({ id: 'cards', label: 'Report Cards' });
     items.push({ id: 'summary', label: 'Summary Sheet' });
   }
+  if (portalSections().length) {
+    items.push({ group: 'STUDENT PORTAL' });
+    items.push({ id: 'portal', label: 'Student Portal' });
+  }
   if (S.user.admin) {
     items.push({ group: 'SETUP' });
     items.push({ id: 'roster', label: 'Learner Rosters' });
@@ -3498,6 +6007,7 @@ async function route() {
     else if (view === 'import' && importAllowed()) viewImport(parts[1], parts[2]);
     else if (view === 'cards') await viewCards(parts[1]);
     else if (view === 'summary') await viewSummary(parts[1]);
+    else if (view === 'portal') await viewPortal(parts[1]);
     else if (view === 'settings' && S.user.admin) await viewSettings();
     else await viewDash();
   } catch (e) {
@@ -4611,6 +7121,249 @@ async function saveSettings(btn) {
   } catch (e) { toast(e.message, true); busy(btn, false); }
 }
 
+/* ------------------------------------------------------------ student portal
+   The learner-facing side of the same data. Class advisers issue and reset
+   the 6-digit PINs for their own section; the principal and administrators
+   for any section. PINs are never stored in the open - only a salted hash -
+   so a forgotten PIN is replaced, never recovered. */
+const PORTAL = { secId: null, issued: null, sel: {} };
+
+function portalSections() {
+  const all = S.user.admin || S.user.principal;
+  const ids = all ? S.sections.map(s => s.id) : (S.user.advises || []);
+  return ids.filter(id => S.sectionMap[id]).map(id => S.sectionMap[id])
+    .sort((a, b) => a.grade - b.grade || a.name.localeCompare(b.name));
+}
+
+async function viewPortal(secId, refresh = true) {
+  const main = $('#main');
+  const secs = portalSections();
+  const lede = 'Learners sign in with their LRN (or the QR code on their school ID) and a PIN they choose themselves, and see the very same written work, performance tasks and term grades that are in these class records.';
+  if (!secs.length) {
+    main.innerHTML = topbar('Student Portal', lede) + `<div class="wrap"><div class="panel"><div class="empty-state">
+      <div class="big">No advisory class yet</div><p>Only a class adviser, the principal or an administrator can issue portal accounts.</p></div></div></div>`;
+    return;
+  }
+  const sec = S.sectionMap[secId] || S.sectionMap[PORTAL.secId] || secs[0];
+  if (PORTAL.secId !== sec.id) { PORTAL.issued = null; PORTAL.sel = {}; }
+  PORTAL.secId = sec.id;
+
+  main.innerHTML = topbar('Student Portal', lede, sectionPicker('portal', secs, sec.id)) +
+    `<div class="wrap" id="portalWrap"><div class="panel"><div class="empty-state">Reading portal accounts…</div></div></div>`;
+
+  let res;
+  try { res = await api('studentAccounts', { sectionId: sec.id }); }
+  catch (e) { $('#portalWrap').innerHTML = `<div class="note bad">${esc(e.message)}</div>`; return; }
+
+  const byLrn = {};
+  res.accounts.forEach(a => byLrn[String(a.lrn)] = a);
+  const learners = learnersOf(sec.id);
+  const withLrn = learners.filter(l => l.lrn);
+  const noLrn = learners.filter(l => !l.lrn);
+  const issued = withLrn.filter(l => byLrn[l.lrn] && byLrn[l.lrn].issued);
+  const active = issued.filter(l => byLrn[l.lrn].activated);
+  const locked = issued.filter(l => byLrn[l.lrn].locked);
+  const pending = withLrn.filter(l => !byLrn[l.lrn] || !byLrn[l.lrn].issued);
+  PORTAL.url = res.portalUrl || '';
+  PORTAL.accounts = res.accounts;
+  PORTAL.pending = pending.map(l => l.lrn);
+
+  const when = iso => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+      d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  };
+  const status = a => {
+    if (!a || !a.issued) return '<span class="pill mute">no account</span>';
+    if (a.locked) return '<span class="pill bad">locked until ' + esc(when(a.lockedUntil)) + '</span>';
+    if (!a.activated) return '<span class="pill warn">PIN not changed yet</span>';
+    return '<span class="pill good">active</span>';
+  };
+
+  const rows = learners.map((l, i) => {
+    const a = byLrn[l.lrn];
+    return `<tr>
+      <td class="num">${i + 1}</td>
+      <td><input type="checkbox" data-psel="${esc(l.lrn || '')}" ${l.lrn ? '' : 'disabled'} ${PORTAL.sel[l.lrn] ? 'checked' : ''}></td>
+      <td>${esc(l.name)}</td>
+      <td class="num">${l.lrn ? esc(l.lrn) : '<span class="pill bad">no LRN</span>'}</td>
+      <td>${status(a)}</td>
+      <td>${esc(when(a && a.lastLogin))}</td>
+      <td>${a && (a.target2 || a.target3) ? esc([a.target2, a.target3].filter(Boolean).join(' → ')) : ''}</td>
+    </tr>`;
+  }).join('');
+
+  const selCount = Object.keys(PORTAL.sel).filter(k => PORTAL.sel[k]).length;
+
+  $('#portalWrap').innerHTML = `
+    ${PORTAL.issued ? pinSlipPanel() : ''}
+
+    <div class="panel"><h3>${esc(sec.label)} <span class="sub">${learners.length} learners &middot; adviser ${esc(sec.adviser || '—')}</span></h3>
+      <div class="panel-body">
+        <div class="two" style="grid-template-columns:repeat(4,1fr);gap:12px">
+          ${statBox('Accounts issued', issued.length + ' of ' + withLrn.length)}
+          ${statBox('Signed in and set own PIN', active.length)}
+          ${statBox('Waiting for first sign-in', issued.length - active.length)}
+          ${statBox('Locked out', locked.length)}
+        </div>
+        ${noLrn.length ? `<div class="note warn" style="margin-top:14px">${noLrn.length} learner${noLrn.length > 1 ? 's have' : ' has'} no LRN on the roster, so no account can be made: <b>${esc(noLrn.map(l => l.name).join(', '))}</b>. Add the LRNs on <button class="linkish" data-go="#/roster">Learner Rosters</button> (or upload the SF1) and come back.</div>` : ''}
+        <p style="margin-bottom:0">
+          <button class="btn" id="portalIssue" ${pending.length ? '' : 'disabled'}>${pending.length ? `Issue PINs for the ${pending.length} learner${pending.length === 1 ? '' : 's'} without an account` : 'Everyone with an LRN already has an account'}</button>
+          <button class="btn ghost" id="portalReset" ${selCount ? '' : 'disabled'}>Reset the PIN of ${selCount} ticked</button>
+          <button class="btn ghost" id="portalUnlock" ${selCount ? '' : 'disabled'}>Unlock ticked</button>
+        </p>
+        <div class="hint">A new PIN is shown to you once, here, and then only its scrambled form is kept. Hand the slips out privately; the learner replaces the PIN with one of their own at first sign-in.</div>
+      </div>
+    </div>
+
+    <div class="panel"><h3>Learners <span class="sub">tick a row to reset or unlock it</span></h3>
+      <div class="tbl-scroll" style="max-height:560px"><table class="grid tight">
+        <thead><tr><th class="num">#</th><th><input type="checkbox" id="pselAll"></th><th>Learner</th><th>LRN</th><th>Portal account</th><th>Last signed in</th><th>Own goal</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7" class="mid">No learners on this roster yet.</td></tr>'}</tbody>
+      </table></div>
+    </div>
+
+    <div class="panel"><h3>The portal address</h3><div class="panel-body">
+      <div class="field" style="max-width:640px">
+        <label for="portalUrl">Where learners open the portal (the Web app address of the portal script, ending in /exec)</label>
+        <input id="portalUrl" spellcheck="false" autocomplete="off" value="${esc(PORTAL.url)}" placeholder="https://script.google.com/macros/s/.../exec" ${S.user.admin ? '' : 'readonly'}>
+      </div>
+      ${S.user.admin ? '<p style="margin-bottom:0"><button class="btn" id="portalSaveUrl">Save the address</button></p>' : '<div class="hint">Only an administrator can change this.</div>'}
+      <div class="hint">It is printed on the PIN slips so learners know where to go.</div>
+    </div></div>
+
+    ${S.user.admin ? `<div class="panel"><h3>Portal server files <span class="sub">set up once</span></h3><div class="panel-body">
+      <ol class="complist" style="margin-top:0">
+        <li>In Google Drive make a new <b>Apps Script</b> project and call it <b>CANHS TSEK</b>.</li>
+        <li>Download <b>Code.gs</b> below and paste all of it over the contents of <code>Code.gs</code>.</li>
+        <li>Add a file: <b>+</b> &rsaquo; HTML &rsaquo; name it <code>Index</code>, then paste in <b>Index.html</b> below.</li>
+        <li>Near the top of <code>Code.gs</code> put this spreadsheet's ID inside <code>CLASS_RECORDS_SHEET_ID</code>: <code>${esc(portalSheetIdHint())}</code></li>
+        <li>Run <b>setUpPortal</b> once, approve the permissions, then <b>Deploy &rsaquo; New deployment &rsaquo; Web app</b>, Execute as <b>Me</b>, Who has access <b>Anyone</b>. Paste the /exec address into the box above.</li>
+      </ol>
+      <p style="margin-bottom:0">
+        <button class="btn" id="portalCodeGs">Download Code.gs</button>
+        <button class="btn ghost" id="portalIndexHtml">Download Index.html</button>
+      </p>
+      <div class="hint">The portal reads this same spreadsheet, so grades never have to be copied anywhere. Download these again after any update to this site, so both sides keep computing grades the same way.</div>
+    </div></div>` : ''}`;
+}
+
+/* keeps the two bulk buttons in step with the ticked rows without
+   redrawing the whole table under the user's finger */
+function portalSyncButtons() {
+  const n = Object.keys(PORTAL.sel).filter(k => PORTAL.sel[k]).length;
+  const r = $('#portalReset'), u = $('#portalUnlock');
+  if (r) { r.disabled = !n; r.textContent = `Reset the PIN of ${n} ticked`; }
+  if (u) u.disabled = !n;
+}
+
+function statBox(label, value) {
+  return `<div class="panel" style="margin:0"><div class="panel-body" style="padding:12px 14px">
+    <div class="sub" style="font-size:11.6px;letter-spacing:.08em;text-transform:uppercase">${esc(label)}</div>
+    <div style="font-size:26px;font-weight:700;line-height:1.1">${esc(String(value))}</div></div></div>`;
+}
+
+function portalSheetIdHint() {
+  return CONN.mode === 'demo' ? 'the ID of your Class Records spreadsheet' : 'the long code in the spreadsheet address, between /d/ and /edit';
+}
+
+function pinSlipPanel() {
+  const list = PORTAL.issued;
+  return `<div class="panel" style="border-color:var(--green);border-left-width:4px">
+    <h3>${list.length} new PIN${list.length === 1 ? '' : 's'} <span class="sub">shown once &middot; print or download now</span></h3>
+    <div class="panel-body">
+      <div class="note warn">These PINs are not stored anywhere in readable form. Once you leave this page they cannot be shown again - only replaced.</div>
+      <div class="tbl-scroll" style="max-height:320px"><table class="grid tight">
+        <thead><tr><th>Learner</th><th>LRN</th><th>Temporary PIN</th></tr></thead>
+        <tbody>${list.map(x => `<tr><td>${esc(x.name)}</td><td class="num">${esc(x.lrn)}</td><td class="num" style="font-size:17px;letter-spacing:.14em">${esc(x.pin)}</td></tr>`).join('')}</tbody>
+      </table></div>
+      <p style="margin-bottom:0">
+        <button class="btn" id="portalSlips">Download the slips (.xlsx)</button>
+        <button class="btn ghost" id="portalSlipsDone">I have kept these</button>
+      </p>
+    </div></div>`;
+}
+
+async function portalIssue(btn, lrns, reissue) {
+  const sec = S.sectionMap[PORTAL.secId];
+  if (reissue && !confirm(`Replace the PIN of ${lrns.length} learner${lrns.length === 1 ? '' : 's'}? Their current PIN stops working straight away.`)) return;
+  busy(btn, true, 'Issuing…');
+  try {
+    const r = await api('issuePins', { sectionId: PORTAL.secId, lrns: lrns || [], reissue: !!reissue });
+    if (!r.issued.length) {
+      toast(r.skipped.length ? r.skipped[0].reason : 'Nothing to issue.', true);
+      busy(btn, false);
+      return;
+    }
+    PORTAL.issued = r.issued;
+    PORTAL.sel = {};
+    await viewPortal(PORTAL.secId);
+    document.getElementById('main').scrollTop = 0;
+    toast(`${r.issued.length} PIN${r.issued.length === 1 ? '' : 's'} issued.`);
+  } catch (e) { toast(e.message, true); busy(btn, false); }
+}
+
+async function portalUnlock(btn, lrns) {
+  busy(btn, true, 'Unlocking…');
+  try {
+    const r = await api('studentUnlock', { sectionId: PORTAL.secId, lrns });
+    PORTAL.sel = {};
+    await viewPortal(PORTAL.secId);
+    toast(`${r.unlocked} account${r.unlocked === 1 ? '' : 's'} unlocked.`);
+  } catch (e) { toast(e.message, true); busy(btn, false); }
+}
+
+function downloadPinSlips() {
+  const sec = S.sectionMap[PORTAL.secId] || { label: PORTAL.secId };
+  const st = S.settings;
+  const aoa = [
+    [st.schoolFull || 'Castor Alviar National High School'],
+    [`${PORTAL_LABEL} — temporary PINs`],
+    [`${sec.label}  ·  School Year ${st.schoolYear}`],
+    [PORTAL.url ? 'Open the portal at: ' + PORTAL.url : 'Portal address not set yet'],
+    [],
+    ['Learner', 'LRN', 'Temporary PIN', 'Change it at first sign-in']
+  ];
+  PORTAL.issued.forEach(x => aoa.push([x.name, x.lrn, x.pin, 'yes']));
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [{ wch: 38 }, { wch: 16 }, { wch: 15 }, { wch: 24 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'PINs');
+  XLSX.writeFile(wb, `Portal PINs ${sec.label} SY ${st.schoolYear}.xlsx`.replace(/[\\/:*?"<>|]/g, '-'));
+}
+
+const PORTAL_LABEL = 'CANHS TSEK — Students’ Proficiency Level';
+
+function unwrapEmbedded(id) {
+  const el = document.getElementById(id);
+  if (!el) return '';
+  return el.textContent.replace(/<\\\/script>/g, '<\/script>').replace(/^\s*\n/, '');
+}
+function downloadText(name, text) {
+  if (!text) return toast('That file is not bundled in this copy of the page.', true);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+async function savePortalUrl(btn) {
+  const url = $('#portalUrl').value.trim();
+  if (url && !/^https:\/\/script\.google\.com\/.+\/exec$/.test(url)) {
+    return toast('That does not look like a Web app address. It starts with https://script.google.com/ and ends in /exec.', true);
+  }
+  busy(btn, true, 'Saving…');
+  try {
+    await api('saveSettings', { settings: { portalUrl: url } });
+    PORTAL.url = url;
+    S.settings.portalUrl = url;
+    busy(btn, false);
+    toast('Portal address saved.');
+  } catch (e) { toast(e.message, true); busy(btn, false); }
+}
+
 /* ------------------------------------------------------------ events */
 document.addEventListener('click', async e => {
   const t = e.target.closest('button, [data-go]');
@@ -4694,6 +7447,14 @@ document.addEventListener('click', async e => {
     case 'ssDownload': return downloadSummary();
     case 'ssPrint': return printSummary();
     case 'codeGs': return downloadCodeGs();
+    case 'portalIssue': return portalIssue(t, PORTAL.pending || [], false);
+    case 'portalReset': return portalIssue(t, Object.keys(PORTAL.sel).filter(k => PORTAL.sel[k]), true);
+    case 'portalUnlock': return portalUnlock(t, Object.keys(PORTAL.sel).filter(k => PORTAL.sel[k]));
+    case 'portalSlips': return downloadPinSlips();
+    case 'portalSlipsDone': PORTAL.issued = null; return viewPortal(PORTAL.secId);
+    case 'portalSaveUrl': return savePortalUrl(t);
+    case 'portalCodeGs': return downloadText('Code.gs', unwrapEmbedded('portalCodeSrc'));
+    case 'portalIndexHtml': return downloadText('Index.html', unwrapEmbedded('portalIndexSrc'));
     case 'doImport': return doImport(t);
     case 'saveSettings': return saveSettings(t);
     case 'resetDemo':
@@ -4710,6 +7471,13 @@ document.addEventListener('change', e => {
   if (e.target.closest && (e.target.closest('#sf1List') || e.target.closest('#sf1Foot')) && onSF1Change(e)) return;
   if (e.target.dataset && e.target.dataset.rcsel !== undefined) { RC.sel[e.target.dataset.rcsel] = e.target.checked; viewCards(RC.secId, false); return; }
   if (e.target.dataset && e.target.dataset.secpick) { go('#/' + e.target.dataset.secpick + '/' + encodeURIComponent(e.target.value)); return; }
+  if (e.target.dataset && e.target.dataset.psel !== undefined) { PORTAL.sel[e.target.dataset.psel] = e.target.checked; return portalSyncButtons(); }
+  if (e.target.id === 'pselAll') {
+    PORTAL.sel = {};
+    if (e.target.checked) learnersOf(PORTAL.secId).forEach(l => { if (l.lrn) PORTAL.sel[l.lrn] = true; });
+    $$('[data-psel]').forEach(b => { if (!b.disabled) b.checked = !!PORTAL.sel[b.dataset.psel]; });
+    return portalSyncButtons();
+  }
   if (e.target.id === 'showDesc') { C.showDesc = e.target.checked; drawClass(); }
   if (e.target.id === 'demoPick' && e.target.value) { $('#email').value = e.target.value; }
 });
