@@ -670,8 +670,8 @@ tr.snd td{background:#FFF8E6}
 .s9-title{text-align:center;font-weight:700;font-size:1.05em;margin-top:.5em}
 .s9-sy{text-align:center;font-weight:700;font-size:.88em}
 .s9-id{display:flex;align-items:flex-end;gap:.7em;margin-top:.5em}
-.s9-id.first{margin-top:10mm}
-.s9-h2.desc{margin-top:.5em}
+.s9-id.first{margin-top:5mm}
+.s9-h2.desc{margin-top:5mm}
 .s9-id .f{display:flex;align-items:flex-end;min-width:0}
 .s9-id .f.grow{flex:1}
 .s9-id .f i{font-style:normal;white-space:nowrap;margin-right:.25em}
@@ -765,7 +765,7 @@ tr.snd td{background:#FFF8E6}
 .s10-box .r:first-child{margin-top:.3mm}
 .s10-box .r.ind{padding-left:5mm}
 .s10-box .oc{font-style:italic}
-.s10-box .cb{width:2.4mm;height:2.4mm;border:.3mm solid #000;flex:none;margin-bottom:.4mm}
+.s10-box .cb{width:2.6mm;height:2.6mm;border:.3mm solid #000;flex:none;margin-bottom:.4mm;display:inline-flex;align-items:center;justify-content:center;font-size:2.2mm;line-height:1;font-weight:700}
 .s10-box .lb{font-style:italic;white-space:nowrap;margin-right:1mm}
 .s10-box .tx{font-style:italic;white-space:nowrap}
 .f.g1{flex:1}.f.g2{flex:2}.f.g3{flex:3}.f.g4{flex:4}.f.g6{flex:6}
@@ -814,6 +814,9 @@ tr.snd td{background:#FFF8E6}
 .s10set td.nm{white-space:nowrap}
 .s10set select{font-size:12px;padding:2px 4px}
 .s10set td.c{text-align:center}
+.s10set tr.on{background:var(--wash,#eef3f8)}
+.s10set td.nm{max-width:210px;overflow:hidden;text-overflow:ellipsis}
+.s10edit .field{margin-bottom:10px}
 .s10all label{display:block;margin:6px 0}
 .s10all select{margin-left:6px}
 @media print{
@@ -1252,12 +1255,34 @@ var CR = (function () {
     return sh.length >= 2 && sh.every(function (t) { return lo.indexOf(t) >= 0; });
   }
   /* a subject teacher of any learning area in the section */
-  /* SF10-JHS per learner: four scholastic tables (Grade 7-10) and four certification blocks.
-     Code = 4 characters, one per grade: T (3 terms), Q (4 quarters) or - (not printed),
-     then 4 characters, 1 or 0, saying whether that grade's certification is printed. */
-  function sf10Code(v) {
-    var c = upper(clean(v)).replace(/[^TQ01-]/g, '');
-    return /^[TQ-]{4}[01]{4}$/.test(c) ? c : '';
+  /* SF10-JHS, per learner, kept as JSON on the learner's row:
+       t  the four scholastic tables, each { g: grade level, m: 'T' 3 terms | 'Q' 4 quarters | '-' not printed }
+          (a learner who repeats a grade simply has that grade on more than one table)
+       c  how many certification blocks are printed
+       e  the eligibility / educational background the school fills in by hand */
+  var SF10_TEXT = ['ave', 'cit', 'sch', 'schid', 'addr', 'peptR', 'alsR', 'othT', 'date', 'center'];
+  var SF10_TICK = ['comp', 'pept', 'als', 'oth'];
+  function sf10Data(v) {
+    var o = v;
+    if (typeof v === 'string') {
+      if (/^[TQ-]{4}[01]{4}$/.test(v)) {                        // the first, shorter form of this setting
+        var t0 = [], c0 = 0;
+        for (var i = 0; i < 4; i++) { t0.push({ g: 7 + i, m: v.charAt(i) }); if (v.charAt(4 + i) === '1') c0++; }
+        o = { t: t0, c: c0, e: {} };
+      } else { try { o = JSON.parse(v); } catch (e) { o = null; } }
+    }
+    if (!o || typeof o !== 'object') return '';
+    var t = (o.t || []).slice(0, 4).map(function (x) {
+      x = x || {};
+      var g = num(x.g);
+      return { g: g !== null && g >= 1 && g <= 12 ? Math.round(g) : '', m: /^[TQ-]$/.test(x.m) ? x.m : '-' };
+    });
+    while (t.length < 4) t.push({ g: '', m: '-' });
+    var e = o.e || {}, out = {};
+    SF10_TEXT.forEach(function (k) { if (clean(e[k])) out[k] = clean(e[k]).slice(0, 150); });
+    SF10_TICK.forEach(function (k) { if (e[k]) out[k] = 1; });
+    var c = num(o.c);
+    return JSON.stringify({ t: t, c: c === null ? 1 : Math.max(0, Math.min(4, Math.round(c))), e: out });
   }
 
   function teachesSection(u, sectionId) { return (u.teaches || []).some(function (t) { return t.sectionId === sectionId; }); }
@@ -1512,7 +1537,7 @@ var CR = (function () {
         var rows = store.read('learners'), n = 0;
         rows.forEach(function (l) {
           if (String(l.sectionId) !== sfSid || sfVals[l.key] === undefined) return;
-          l.sf10 = sf10Code(sfVals[l.key]); n++;
+          l.sf10 = sf10Data(sfVals[l.key]); n++;
         });
         store.write('learners', rows);
         log(store, env, email, 'sf10-set', n + ' learners in ' + sfSid);
@@ -1571,7 +1596,7 @@ var CR = (function () {
             keep.push({ sectionId: sid, order: i + 1, sex: /^F/i.test(l.sex) ? 'F' : 'M', name: nm, key: k,
               lrn: clean(l.lrn).replace(/[^0-9A-Za-z-]/g, '').slice(0, 20), age: clean(l.age).replace(/[^0-9]/g, '').slice(0, 3),
               bday: clean(l.bday).replace(/[^0-9-]/g, '').slice(0, 10),
-              sf10: sf10Code(l.sf10) || prevSF10[sid + '|' + k] || '' });
+              sf10: sf10Data(l.sf10) || prevSF10[sid + '|' + k] || '' });
             added++;
           });
         });
@@ -3262,7 +3287,7 @@ async function saveSF1(btn) {
     await loadAll();
     SF1.items = [];
     toast(`Updated ${r.sections} roster${r.sections === 1 ? '' : 's'} (${r.learners} learners): ${add} added, ${lrn} LRNs filled in, ${ren} names corrected.`);
-    viewRoster();
+    route();                         // the SF1 panel also lives on the SF10 page, so redraw whichever is open
   } catch (e) { toast(e.message, true); busy(btn, false); }
 }
 
@@ -3510,11 +3535,12 @@ function sf9PagesHtml(sec, learners, G) {
   let html = '';
   for (let i = 0; i < learners.length; i += 2) {
     const chunk = learners.slice(i, i + 2);
-    html += page(chunk.map(l => sf9FrontHtml(sec, l, G, SF9.upto)).join(''));
+    if (SF9.side !== 'back') html += page(chunk.map(l => sf9FrontHtml(sec, l, G, SF9.upto)).join(''));
     /* The backs are printed the other way round — the learner on the left of the front sheet has
        their back on the right — so that printing on both sides puts each learner's front and back
-       on the same half of the sheet. A lone learner's back sits on the right, with the left empty. */
-    if (SF9.side === 'both') {
+       on the same half of the sheet. A lone learner's back sits on the right, with the left empty.
+       Backs alone keep the same mirrored order, so they still match fronts printed earlier. */
+    if (SF9.side !== 'front') {
       const backs = chunk.slice().reverse();
       if (backs.length === 1) backs.unshift(null);
       html += page(backs.map(l => l ? sf9BackHtml(sec, l) : '<div class="s9"></div>').join(''));
@@ -3555,14 +3581,16 @@ async function viewSF9(secId, refresh = true) {
     <div class="panel">
       <div class="controls">
         ${sectionPicker('sf9', secs, sec.id)}
-        <div class="ctl"><label>Pages</label>${seg('side', [['both', 'Front &amp; back'], ['front', 'Front only']])}</div>
+        <div class="ctl"><label>Pages</label>${seg('side', [['both', 'Front &amp; back'], ['front', 'Front only'], ['back', 'Back only']])}</div>
         <div class="ctl"><label>Grades shown</label>${seg('upto', [[1, 'Term 1'], [2, 'Terms 1–2'], [3, 'Terms 1–3 &amp; final']])}</div>
         <div class="ctl"><label>&nbsp;</label><button class="btn" id="s9Print" ${chosen.length ? '' : 'disabled'}>Print ${chosen.length} SF9</button>
           <button class="btn ghost" id="s9Pdf" ${chosen.length ? '' : 'disabled'}>Download PDF</button></div>
       </div>
       <div class="panel-body">
         <p class="hint" style="margin-top:0">${esc(sec.label)} · Adviser: ${esc(adviserName(sec) || '—')} · ${chosen.length} of ${learners.length} learners selected · ${sheets} sheet${sheets === 1 ? '' : 's'}, landscape, two learners side by side.
-          ${SF9.side === 'both' ? 'Sheet 1 carries the fronts of two learners and sheet 2 their two backs, in the opposite order — the learner printed on the left of the front is on the right of the back — so printing on both sides (turn the sheet over sideways, like a page) gives each learner one complete form.' : 'Only the front of the form is printed.'}
+          ${SF9.side === 'both' ? 'Sheet 1 carries the fronts of two learners and sheet 2 their two backs, in the opposite order — the learner printed on the left of the front is on the right of the back — so printing on both sides (turn the sheet over sideways, like a page) gives each learner one complete form.'
+            : SF9.side === 'front' ? 'Only the front of the form is printed.'
+            : 'Only the back of the form is printed, in the mirrored order — the learner on the left of the front sheet is on the right here — so these sheets go through the printer again behind the fronts, or onto their reverse.'}
           A4 only, and the scale must stay at 100% (Actual size).</p>
         ${missDays ? `<div class="note warn" style="margin:0 0 10px">The number of class days for ${esc(days.map((d, i) => d === '' ? SF9_MONTHS[i] : '').filter(Boolean).join(', '))} is not set yet, so those boxes print blank. ${S.user.admin ? 'Set them in <b>Settings &amp; Activity</b> — they change every school year.' : 'Ask the principal to fill them in under Settings.'}</div>` : `<div class="note info" style="margin:0 0 10px">Class days: ${SF9_MONTHS.map((m, i) => m + ' ' + days[i]).join(' · ')} · <b>Total ${sf9DaysTotal(days)}</b></div>`}
         ${noAge ? `<div class="note" style="margin:0 0 10px">${noAge} selected learner${noAge === 1 ? ' has' : 's have'} no age on file, so the Age box prints blank. Ages come from the SF1 School Register upload.</div>` : ''}
@@ -3575,13 +3603,13 @@ async function viewSF9(secId, refresh = true) {
         </details>
       </div>
     </div>
-    <div class="panel"><h3>Preview <span class="sub">${SF9.side === 'both' ? 'front and back of the first sheet' : 'first sheet'}</span></h3><div class="panel-body rcpreview" id="s9Preview"></div></div>
+    <div class="panel"><h3>Preview <span class="sub">${SF9.side === 'both' ? 'front and back of the first sheet' : SF9.side === 'back' ? 'first back sheet' : 'first sheet'}</span></h3><div class="panel-body rcpreview" id="s9Preview"></div></div>
   </div>`;
   const prev = document.getElementById('s9Preview');
   const geo = sf9Geo();
   const k = Math.min(1, (prev.clientWidth - 4) / (geo.pw * 3.7795));
   const html = sf9PagesHtml(sec, chosen.slice(0, 2), G);
-  prev.innerHTML = `<div class="rcscale" style="width:${geo.pw * 3.7795 * k}px;height:${geo.ph * 3.7795 * k * (SF9.side === 'both' ? 2 : 1)}px"><div style="transform:scale(${k});transform-origin:0 0">${html}</div></div>`;
+  prev.innerHTML = `<div class="rcscale" style="width:${geo.pw * 3.7795 * k}px;height:${geo.ph * 3.7795 * k * ((html.match(/class="s9-page"/g) || []).length || 1)}px"><div style="transform:scale(${k});transform-origin:0 0">${html}</div></div>`;
   if (!refresh) main.scrollTop = keepY;
 }
 
@@ -3651,41 +3679,54 @@ async function downloadSF9Pdf(btn) {
 const SF10_DEPED_MARK = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAASwAAACcCAMAAADyHmaGAAAAwFBMVEX///////39/////v7+/v/+/v7+/f79/v79/f7+/fz+/Pz8/f35/P38+vr2+Pjx7O3l6Ovh3+HU3eXe0dXevKq8y9emvM2htMKSscm8p7CCpL26iZRijK1Pf6Q9cZsnZZY+WoUOVY0IUowFUYwFUIsEUIsET4sDUIwDT4wDT4sDT4oBT4ziKEDhHTniHDjhHDjhHDfiGTbjFTLgHzrgHD7gHDjgHDfgFjPaMUndGjZVQW4BS4gATYoAS4gAR4YAQYK6vaoPAAAfbUlEQVR42u2dC3eqSBKAW5SLylOUx0UeBwRnYmISdTOaI+D//1db1aDyUjHJzuzusc5MbqKAzUd1dVV1dUvIf42w5CEtpdt9MGitVr+IPHxgaMdqyEwm4uChXe3s1XQn/3qwaieT7ZSIDwytZLRbT5mHzWojv8h0td6NyOCBooXbIO22m/XkoVotZEAmL6sNqNaD1m0ZkunH+9tmPZWGj/GwBazP17e3DQyID1ptYL2/vS1fP3+TB6ybsCab1cfHx3L1OXnQuGngxy+rt7ePt+V6N2YeynXDdRB22yXAQloTvvvI1dxwSreoWUBr9flbGD5oNXbA4QDBdMno5Z3Cets8aF3rgiL1RKfrzQcK0powj1xNVVgijscjCXoh22Xl3SvVrI8PcOXHDyNfp8WPp7vddCKQbrc3WW/eKC1w5XfKA06DyLv19mUHuFhpmtEC/QJa0kO3GmT0slxtV1OhiymtzVs+Jm6B1kNq5r2Plv1tPeWHZLxZLTNYb6/bR1DdIAKF9b4ad4cC7YgU1vL98/cjX9MM62P5uWNEMt5tM/+BDokj8qBVDaJ3qyUo0/YF2Ai79TLTrDegNZUfvmlFxh+05602EyJi8mGZwwIjPxEes9RlyYPC1eY3ERkYEE+wNo8ZjKoPn+dmqGYNB0IBFvW2Og/VOhssZrrNDPrqZQxRNdnlf+ZGfsI8GJ1ZTXLXCrxQucv+EmA4xBeO6ZqHa3pm9Us5Oe3bKRmw4MSvdpu3ZQ7r7WP7yDIfDRZ4ods8HHzfjFky7E4277vddnOCtdoJD06ZYqF1z2At11NCmAE6qNMSLDD7D18LZNCVjwk/ME4y2x2iB7+boJN6ks/pw43Prfvnkhrz5RKGve6ASLv1B4V10qzleif8eqAiXUxlbT4yVlMJWU23q9201A1xauzhmAIsDlOjFBawglBHmq7fXgDWS1GzqK/6gAWdbrXMHXW5KxIwYP/aUMU6+Vnw4/VhtFD6kyx5tdlCTxMxTZqx2pzCHQpr+4CFsltlA+FmwmSssA/uXlYfRVk+Kk3RvI+Xf1Hd2U4FyuoDUCGrZUmz/qdhMWzvZ5wsCJmzgAYMFvhXZ1ZvJVhv/wys7o1EmqxcF0mSxEGHWpufSM2MXqgh/9j+JkzOarf7OE1Y3Dbwony/wOfeOkQSRZFnsud5Wew0iVEaftJ/Zr7n2qaqSB3C8N/NMg3J780Kcfy1k9DfoqzglZPTcMt1QG9//dcK5TP7+Vn8o/oT311jLpbZrVcXj8R/Ni+73fT3WJYY0r08snjx4gml4eci+wnY0tR3TLVDOP67sKafb5mL1YeA8F/UZShiOsGCofIirE3x+NrJpQvRJNCIDKXcEW48kv7z12q7Xq9308lIIMMLuGQ/XtyQeRTOZosk9S2VEIH9Hixwp7L0HijWagNBzvajQbI010VYH3cIXErA+aP18taBy81m8468xoCr4cP7RA9uaFb+RzQLng+erX3PdA0ZnMdBh3TMjNcrYNWsEHCHzbOH92vWKx0qijMizZqVz1tuNivERRoeFU+s+KkVLPgZBvHBt+Tv0EJYGwprwvxeg4P1UjHt+T2+f067g5+Btfr4DbCm2+VbG1jotWzW2x0EYmwdlpNGbWFRXKmrkq8bLvGkWVMwWS/T3ar5HlebcXM+6wuw4FI4MblpCwtah7hqU70skbzkDlhPi1mYeBrhvmHgqecABlyYgLrnfkTtHqEXXkwc3glru+OHWe1Ja1iA63VdG2H6RPMB1j0ynyX+13ULR8O/qDndTsbrXTXIOQl4Yddg3WPgtzusIC9lFtsMC5saLZ4YQTy/R7PQ1Me+9tWcLy18z7Psk3/tdsu3Zs3ayeSnNGtF7ft2ubxHs7KkiFK6TQFc0ujpTlhP89hTvjivx3TlY0J09bJ72W0a2w8Wjf0xWFs0WecyndawaAqp2AxedNPZ3bCeosQRv6haWS03HXReVx8vmybNwlZeqv+7F9bb+4vMkGzm7U5Y7/DMuKLJGnlJeD+s+VNsfNVssTIdAXGdwLFjVJq5fN2MmZ/SrM1qJ3aoS3o3LFyANekWTJbux/fZ90zCvSezX3XlJzcMNLoVF4v/7jXw9GIEZ0g+viCrwqAsEHP/x/x+zVrMnwKDfHEalMUwbQnBBWoWGHgQ+sfx5/Uimrs1C7zfATM5Fa3epVkfq+Xk1BS+Yx+CqCJzkPMfzbCeZqkjMl9TLVpw+/q+uiCvuHRgSO6Dtbwom3cYV3GecnlNLsEqRF1ostI/np/j56o8HTUrCoKwCVb4DO7DBdViWa6PwrHNPXUAtD43m89GgdenwoC9D9ZF8qtXHCvI6AWeQfHVo8DJ7+9v6FVtls2wXsZ52MWDS4oSnCUMQ2qU6K9R9JQc0udg3tAZg4PVqZt4lucF/tzNmb4g8GwDLfn3ZZnI15y4Rlibi/LyCUEeM/ncFV4rPJrXV6pYf23X61VjBuf1lLDtE9XQdaNJdF03qViOn0ZhA6zUVSpRD8sL9AVRypKvsixigpUr8wKevHg1XPrFU6FHUunfgLWaTi7LiCHMaHJLprsX6Kl1WFhXd8dyIlmz5/GsPh4+QT/kSxDgR0fVLdt2HBfFcRzb0lUAxvDfK/Io4GoaDeHpf3uKQZ5M12/1UXZZCHrgqStwbxXRBEk4CbTP8BucsSDVi7CAhqxbjuenh0N6ksNh4TmWJp62yGLJqFmVa6IRRc9EG5GzDjdp1nYqXpKhiBZnIA7HU5wYKchuOoa3h8fjoPkTWtpT8fneC+ltaDzcUUXMoulmBa5Do+0qrINdGg9HNoBKk+dZUJIFZqRdWy14doHfQkIHDGp+pOfo5Dqs2yHp+HNdkW0pyc8OwbQhrVo0cZ5lAlj+YlaUIAzM8jgHHcwIa+nUWVI0WortJ0kczcKoYt2icBbF6d63ZcJkkXuYzYbckBRhxU/ZxEkaOAphvgdrtyqb/teXyozIAH3X12UdltA9dwu/zCF6isyqU8ARJ6nlHqJTpoYZ6H4SP4XRBb82Chdx4mkdLk9zRC1kj7CeZ/T3MKKn89+DtS5zqE8fZZWtTbmHwT2wWKIGcRVEcMgtPN8xk+wa14KAeKHD8EthVQ+qn7d4Siis8PhKmOTjyX8QVlaRuKzBOln4DFZRokUdFoibVMfD4GCQXuatYU7sZtIQs2A9CqtN9ElhxeH501JXZvivjobD+uxOAywGVasSQ25WVVi3NAuOM9KwqlmpherZ5xUviZ5uatZTFHsqJ3xRs8BGptaw/5/VLDLsZrOaBc1avp6PawmLIeq+DssWCdPhBzZyvA0LbtfufAMWsAYtbob1q3tB7oPF4srHCqzNdnIcDlvDkrw4qsBKbAn7leY/zVrBCve+xnwZFnR7E0aaZg9euCT3wSJEetnW8qX3woKrOMmsfEOzxJFIvyfZafDUChb2JPINWCl8HtsE6/1ld0GOxSWtYeU1PtdgtTDwQyutxDwzbDxVrLBlyjA4OOJdBv65eOUw9pQjrGqObtso689JGdYNA5/BqmUP79esjnlWoIJmcbx1CJ5qmhVS731e1azEHaF/29Yp3cdB4arhAhw77o58VmHU/0nNagPLaIRFFJd2zxKsWRBjDJXOogostNGq1U50ojp+/GexYZdhNWfu1qfikvawpj8Cq6ZZ1MATFcKZCqwgPniObdsuePUlWCG6Wq2lR4aaF38P1hHH3w3LqsFC14HoWS8swJodPEvDOVLFDJ5LtjtLr2aiZqkFQamn0rIDeAJOGbq7X4aFxSV3w6p2Q+o63OmUEtFOZw1OqZiNhQVYs4SmGHi4W2InYU2z+GPZwD7wD46kwr8lAWMlnBIeHS/5umYhjsG3Yb1VndKboyGDrkNYD3eoR1F+FfWtz2M6gue1NCiNn4mXx94skb3kjxmEMIqfPJXS/4l9TpNxjJMUGnaG1bKI7TT93no0ZGqj4Wp3vwff4JQedEJkNw6LmjXbe6PjzTIMwir5Wa6SF3fxxN3Pgr2ryP4+LGYbnkKrAAt08+uatd0xg287pfVA+iasHlH8p/K0WDSbQ3dTvDKs4GCdT2b1Miz0s/J8IY8YMCUm+Ulp4hJ7av+HYE3Jr3vDndHLqgZrdF+KBkSrBtLUR0RYUQFW9Geon07mO045wYoevHCqONxTV2LgJ8XKlHnij86TOwAr/jKst79+n67UEtYvdrKpw5LuS/7BcVYSVnPwtoQKtyjCOptwvLT+Z6nfRrF/Stv3iR4+U7+rDCtKvGGP/Aisvz7OO5e1zTocPYdSppQp5ODbhTteUotd8DCEVQ5JjrB4olauPEs9uccdPxezVWjwvVIx3RzCnH4R1tcN/Gon3pnPIh2pls96/ZyUcvBtMqWjaqY0/CPAKelKNzzD6oPtT8oefJTahQvLmNrzEVbZZtmFKdbvaNZytevdmc/qY6a+MrtTGAxb5+CtfSUzAG4ADnsVA0/dTj6rDHCx4y7KBYO98+RZF8+EoyuwFsZPwdpOmTthYU3za22S9VyP3woW05PwlirT9/aA48BdKsGKngM0S3B1zUvCSiCd2IPirKwTR+FCI25SNGzxXC09pHaw3hurHCZ3whp0R7VlGEswWSK5BxZPzHllKmwe7U1cbFH1s6gl44looN0u57P2XrlO1I6jWVqD5QtfgLVsLHMoVA+2giUyWHlaDi9LR7WB1edlL63U0lDbzPeOOcECLFsUiAzu0byS/IsSo6z0VjzHCSKnCGseu+z9sMCu1OX3RLwvBz/s1uu/IRZXzkst2oyGArHCp6iW+RvwbI/GhuVox5WI6qa14ghwQCvVIHoyxyDAScqDYbcMq81o+DOzO0Nhst3UQqbiQr4WmsUzipdUq3T/DAxGoMmIctYBbLZp+cmsmlYO//RVpry8U01oxFTQHVQ/i9yvWdvpsEEG983uDJhRvUoXDirUmN2GxfISTTiUDwKXiWPxbqopmnnsp3FQzcHPZ6lB+mVYUkB9NbvYDcNyX20N6/tTYd2uvKvXUpZ3W7oJi2UH1jyoVjA8763cQ1CDqJz8i55nYXXCAiy5xfOVdcMQmtdhpdo/A6vbFU97CRXDy9/kDlgMdLR9FFVLuxNQrOxuwNGqpJWj2uzOHNxRgamusRacBMNuq6xZCun9I5pFclYVv1bqtofFMsTYL6LadFVsZa4jS/KZsGtTYdFzYov1tVEDO/ERVsFmAQ+ZMH8/rG6XmX6+1vzazfo3U9esS6MhRGl63FQo78tnF+wQ3KiZf04twjBNiWr/YHesuBhawljK/O2jIZZmfawaSugrCz2uaVZfQOeyYe0mnSw9wlK9/eyaZgXx3hqQpn0O9NRP7Y6xL3pvjvS326zBkEh0U72KZi2Xn2Om28pmsbyAJWpJXF9TQOfAjs+/Pygk5xsWrgSJbzUuT2SIegBYQyMuVtfb4t8Lix2KhBlPPxvW0+JXJ5VrzJth8RLWHSumm/4R1hCEc6+QnxPplPQlWLNZ6mnNq3xYooRB6oh6AVaQWp0KrKQVrF9XBIuNm2ENxeEvQkbTXVaoXA+hKws9GmFhBedAs9w0DaIaAnSZigExLznppcKQWRzaI9JcqgywPHDYJW1RgAXhT+8rsL6oWTAkj6e77bphId/y9XMi1Nb9jmpbFcxt3bJdP0lnwYWCBYYjbRZLzVNXE5EVk0nlkyEIp7CKwZJa6rIcaTW7s5qOr4ncaODfN9PfuFnJdr3cNC+QksQuuaFZmDEO5kmaRLOmJa7haTrr5OGLbtpYzPYcWNK1CWcIwmH0K2hWFAUZLIqVYdl+Mdt1Jeuwebkim3GjZuG6jI/tGlA1pcSWTXuHN8J6jrGatnFVWITZuWoCRz/OPFeOXziaIksnkcWygRdh+HBldXGatqZzIKXBQG83I71arbY0iVX7uV1tX6QLsFar92yN00dDmnXTsNqqEdblJXTzELyGSoyXWZZGmxWnie95uNgC/veK40LuaD27ymh+gkWrxfGQDspAUjQswGyTKa2swjv//NhsMRXfCOtysnX5WphG+zIsHNu56lKWHqt4i0ZY8zBcZDsAJfDDqTLWDzNPUeZxoVwNFzl1tKyOBitL5t8oDDnuLs/cDWvzOWW65AKstjKDu2lYZciAfzm7vI9NLrHBVrqvlkaeIkdxaeqfYwb2ga76SJNZWAot7pvdORrqMdNo4C8Lro1mBoR8S7MWWJvQuLyNZW0693z9EqPqZiVqsPAUMThr1gHcLBZgpdmqvtm87NN8QbOgJ2LIco9mfVxcCXYPrIZVc6eOKDsYT1+5RBS7QnXiSfViXyF+AZZOOIRVzJF9DxaYrHthoTfKXHAN28KKotRRLi25Bw/Tad7z4BzJWGzVZikASz3DmgcpePsXYWVj5b2w1lOB3GOzlqvtVL6wRLstrChM9rZ0eX8jnihuOouuwNqrlWgavFInAcfKi0+PI7gGC8ZKubla+SqsCdNtD2u5XG+A7oB8B9bsz9QzCLmyTUgfbj1fIdx0iTCumTuaC1sUYIXPuHTqIiwIHIdM7z5Yy+WG7jrcEhZu1zMhF79/q9VoOAuSxFFvbJvFgpMZNkdINEiyxFq8A5Y8ofP3eTYLg4N+BqthWKWd9M59HTarrGCo1Wi42aw/L+6B006z5gEW1JrizS3G4C51N02CYF7XrPlsr9UuwBHrAMGge9w5iPqk/UuahU5Yj71zXweM8FChb2vWku6ZNRHIr6/DCoNZcvAslTC3t2NjOSKbgGsWhFVYoDRKDZZAzANOScfRGQd4Ic2wZvOsiuJeWBPqMd2CtdwscTe2EekOvqpZURTFaewYbbdFZDFfqDv7NIHQsjQjjb2wVx8U9BinpI+ahT4pcwFW9AQWi+/eCQuXdNGC5auwwBdbrZdTXKd/fTsiCqu6YwiWdmI0DUGKa6kyTuC3rF3HnTll1XCCFAOcZ5zYoTLb63WvA5ey0Pn76ES0w5MmWPN5HFoSTlTmsJbt5LQMNVv2Wz8Av9httd2+glJJDBne2IAeYIVwY1VJk3jhe7ahSh0gcM+GiH0Oa8IUzXa8YI7Lm/FycQpBdL8BlodT0mdYNJ9NYYUFwUXWntbNBlMK68JanZq8Hsv26FnZep41/neSz4+X3XQiS9AnBjf36sd8pe9Vl757nmPpCqEpXu7eLRnY3MnvjjCH6Hlwdc+3B0zD5oyqdzAorGx/vFQ/wkrSkgRg+XMvDW/74iKwmrzkZXuXzpoCqMwhavflZH3cWBg3+BjloqqKeA6Rv7inRKGQR4YrQ1/mGlyzkXswOkfNiv5Y5LAsrySurQ+K3tlo3FpGJ+eOz7eQHp1krPzMFyExPM/9wBe5sFyf55mrfiyYKesI61g1SKTyTtgiIT+zY3htv6XBYHDnbbIV4SCW/cEWMfSajbkKcOELsIqVzuVRQ+ArWwqwv1oK2714myz7v/W9PhxYJ2tg5Qt8CotV+lxRHl9WlFfJHeyhkYZ5ZtEd/cSW8/+3sMyDPTCOmoWpRe5B5TKs1B7qeb1qtmD8QeUiLD1yhtoR1sHuPOwTuZwx1HxXLMAij+/puwJL9VxRPRr44uq7h9RhjTwPYGXTaGH6gHU1MJVdT1QAFjrw89h8wLoWDomuJyiZzYqeF8YD1tXh0AkEKcuUFpdu/t9Jr9CbvtIDM1j2kyRlmb7oUmj4n2z63QEan+05kdXn9YXjFhRs/nJui2kcwubHsjS8PW+7xAunWBd+7RM+f4djju+w9Bfm+Ea2+yvCiiXJX8wrcTRuD8vnJ54alF/92Lxas/G30+f1BZ7jsCn0LJ6UGszQ65yOyw7DD6KH9wp3c3lsaj6C79TzWlyfFGo/h20fJHdOS3WGeXCYIKwomwg7rxjOP5pt9bAbPlGoJNfY0rcFnfMyp7XvrToJS9RsY2DcqRbURzOzP7WBYur0ZQpqAP/i4JXtIqzBTas2vkuPNVT4oWaLVCUN39bMbLNhRcJ3OvRMOHqoW3iSaVqmRachAVYq5ztGAKxxvuEikXQsOaIfqRwbBMxZcrywdnzdgKvDhVT8S4GPh/e1IVYGmHTzn6wiTMWkomqZ2YfDp490PC6bjoLDTFzWgferEI6hv2gXAnrFSnxL1y3cOZVnVTvxgYjjSoo5iy3d8SyRboZiY4wraX7q6LbnqB3Lg+b5ETTStRXNg1AFVBAXkYeWymnuwYG3PVPSHFxF3iOy5nma5Npw6QTOtLJtOzE4VKRsMWyY5Hl6jqiuo2u6g3ubcoqVYvMcl4JUrdQzdBP+ki0/xWa7jjEgnGoffFPmWEn3HVXsDSz4JE23Auq5SZ4n8wRaAy2K6bVkw0sdFQZj04PjTM+Dayjwmi1xcA0DrnEpoFdxNoGImh+Y0KDx3oPXZFshsgd3JHupSSRiH7xs+wp3bxDJOTiShed4gUiIZnQIIMG773XMg4fbr1oHEw7WbEJ0XBhAqwNteC5wuJU6oKkWLR7liXFQpWwx7CzNaiT7ABxT7kS0Dw5+/QSmuYjiICyGjA7OADd1Qec/haOGqpviLJt2cGXSZ0nHMQnXsVOLZsZNGkDph0CHz4WrSO6zgp2CiC7uDTMwD7TuHqcCoI3mIbVwqqDjXByWWYCl4goBNQALy41jD+2bJLCK52s83LZDuJHtB/ilFUzf3VvwkMJnWQIbJ3uBzPf7Eic4LsQqYGIU1/VVDp7swRQkUHKeB93E1SgCb1l9XiISb+0d+DRJyDqckariERathmAZeBYaEeAYuAdzwKrPngaDiEKtD6cCFGwe31O9fdZs76B3WICl9OhstokT3U6H4XmeUXBrVOI4B3vIYIMV9xnOYSRWBljwVEJ4PvhJeuArLKd7bmqAfeds/eKX7SEseCjc0D7YXTJOQLMkHbcRA1gshUUsy06drkA1y4JHkPoi6eHmO7OsNECwjQOt3dIdG9SRwsL9vnEe1db9xOiAdcL1ACzQT4B+72hX9b2GsLLcHyovdMInDw0gywI1XBaLO2UQVcxMtYo74YkGD795CWgniwlER0LNolP/Hdsksp8UAyfF0Q6eyqDOIiyqNAgL1BsUC26j3xtRRTMtLQ1UHKIvO3wZLLoo1ZHJeOGpqgnWgsIiAxe6oeioo31mUQBWR3aQGCnAkpyRA8+3LzmagxVn2AxVtSwGYYlG6htDnsIiOazTIKSHmugkuWYNOJbQHjXKrf/BVxCWrqqOcoTlatA83OWMwoKjjIV/hNVjCMDSouB8t/CBhuTt0cSfYLEZLJwuwaaA7QLdY7HT2pRFC1hgP6CVWuDbYMGpZgWaYvmWxGqOpnh7Grm5iWO4nt6pwHIHGvYi0xbdHJYLV7GoZslgpnyDNMPSAn2YrUkHWB3qK1Al7WfWPwZYC9+xnWwZGsLysHniUbOyNQvyCRZqlrEvuLe86GoK9BmJ61VhKe7BpMcJDBzQh9b3wE6CA9MCFpg71CzshmNL7iMs0A7cFsRyLQvGNwnuxU1s04fj2TIsT4THBERH8lGzTLT8jICw8GtFfPUCLN8Y2BmsQ77LmH7I2iP0oLtTzdIk5axZ0A1VW+qfNIsraRbC0sPQoFv5E6bHEc2zrWz8adIsoE7AvoBmDVCzeHjNU2/CYhiclxowMBoKgqTkNguxc4pjqqqerVjCXmnBiFeDRfTUcSxoQJDDEiQJbxA1i5fgFPcCLLMMi6MDDYPefodao9xmSaduKAuiypOzZlmUX2Z4YQjVieKf9nHpwEBuqSq4Mjp60mVYvJXpMNsD66jnY6cCQ717AxZYTAU1BmHRvcQ1CqsvwVihgcIRATEJaLN4GH8qNkvxBozsgkfVl50/jpoFUYWkZbAY0U7jI6y0CGvsW7gGLysbxztk0TOxwHr1GXjKOkthscLRFwfNkhhANO6A66Ci+z7yUq0L6OYa1R0HHjA+TQ6ZSMZIRtTQtW2JlnIWYcGTSnXKW/Wwm1sAC4EmqXYNFn6pnAIu1AAedeLhwCM71GahO9Cx7Q5EUAb1ScCrgVEkhXcorCirFFA9IoAeAA7ZgefN4O9IRLeJgTVX2MxDAdZpsSLCyrdenOXqwHc031ez/oimU02yLnTWLDrCocug0YYeLBaXtmQukwksUVFsGllprqC7Ul/gVN9XKKw4gyUhLEa0sqtBc3WmRyx4iiwq+2VYsrVfOJpmea7GcrxiLwLbMAzX5vVgb4HnKxkB9Ower+99Azz4vSNzohV6Gi8qhh8a6BtJlq+DjfXUDqeBVyXxKhgJyzDAy5dtXxez/aEoLGkECqhKBVgeOGJYB5IcbRYW13jWSDE9SyI9yUwDbEbmE45grIDmgYPOm/7e1TXDdbEQAssm9jbcBVZzgkbbPoxJ0D5r5IG147gxPCuZk3VwscHPhZsBbx2jI8sH86/aMGIxrOrCTTF0LcMFWGAAAQ3ERwa1oLJhZftfQmPpb2A6LQOd3xHePD0Wb35sWSPJoC/h1em/oiZDbIa/KmZ+EUPWDXo2Dlp6l353DcqxPhWU/vR1I7Zj5k3sgJ9n27ZFFxnAxxumntOVjttzmiPVypqtHmNcyYBzjGMhyMjCK2gjaInG0/NMjdewXTpaHLrFJ/2SkvwsJjsGlw5xxNT+OxNrrFSQ/4Hcbj/7riomT77kAo4tvpq9Dw53j77I0Xfoi73s2PyvPpvlN86nZqfnb5FjnRfb759eyXrPuSqsMBOG30/UP5/AnXNDx+b18k8obLYF53Dnu6JX6OUflrX7dC3mfNHzWfha3qz/ytlLNkuR5KL932aVH/IP6FbhWwEeevV/Iv8G8UXjwyzoGlcAAAAASUVORK5CYII=';
 /* ================================================================
    SF10-JHS — Learner Permanent Academic Record for Junior High School
-   (formerly Form 137). One learner per set of pages, long bond, portrait:
+   (formerly Form 137). Long bond, portrait, one learner at a time:
      page 1  masthead · Learner's Information · Eligibility · the first
-             scholastic tables, and the certifications that still fit
+             scholastic tables, and the certification blocks that still fit
      page 2  NAME / LRN heading · the remaining tables and certifications
-   Every learner carries four tables (Grade 7 to Grade 10). For each one the
-   adviser says whether it is printed and whether it is the three-term or the
-   four-quarter form, and whether that grade's certification is printed.
+   Each learner has four scholastic tables. The grade level of every table is
+   set per learner — a learner who repeats a year simply has that grade on two
+   tables — together with whether it is the three-term or the four-quarter
+   form, or not printed at all. The eligibility block is typed and ticked here
+   and kept with the learner, and the certification is general: the site fills
+   in only the name and the LRN.
    ================================================================ */
 const SF10_AREAS = [['FIL', 'Filipino'], ['ENG', 'English'], ['MATH', 'Mathematics'], ['SCI', 'Science'],
   ['AP', 'Araling Panlipunan (AP)'], ['VE', 'Values Education'],
   ['TLE', 'Technology and Livelihood Education (TLE)'], ['MAPEH', 'MAPEH']];
 const SF10_PARTS = [['MA', 'Music and Arts'], ['PEH', 'Physical Education and Health']];
 const SF10_BLANK = 5;                 // empty learning-area rows, as on the printed form
-const SF10_GRADES = [7, 8, 9, 10];
-const SF10 = { secId: null, sel: {}, codes: {}, saved: {} };
+const SF10_LEVELS = [7, 8, 9, 10];
+const SF10_TABLES = [0, 1, 2, 3];
+const SF10 = { secId: null, sel: {}, recs: {}, editKey: null };
 
 /* heights used to decide what goes on which page, in mm (checked against the rendered form) */
 const SF10_H = { page: 310, head: 57, cont: 4, band: 5, table: 104, cert: 25 };
 
-function sf10DefaultCode(sec) {
-  let t = '', c = '';
-  SF10_GRADES.forEach(g => { t += g <= sec.grade ? 'T' : '-'; c += g === sec.grade ? '1' : '0'; });
-  return t + c;
+function sf10Def(sec) {
+  return { t: SF10_LEVELS.map(g => ({ g, m: g <= sec.grade ? 'T' : '-' })), c: 1, e: {} };
 }
-function sf10Valid(code) { return /^[TQ-]{4}[01]{4}$/.test(String(code || '')); }
-function sf10CodeOf(sec, l) {
-  const c = SF10.codes[l.key] || l.sf10;
-  return sf10Valid(c) ? c : sf10DefaultCode(sec);
+function sf10Parse(v, sec) {
+  if (!v) return null;
+  if (/^[TQ-]{4}[01]{4}$/.test(v)) {                       // the first, shorter form of this setting
+    let c = 0;
+    const t = SF10_LEVELS.map((g, i) => { if (v.charAt(4 + i) === '1') c++; return { g, m: v.charAt(i) }; });
+    return { t, c, e: {} };
+  }
+  try {
+    const o = JSON.parse(v);
+    if (!o || !o.t) return null;
+    const t = o.t.slice(0, 4).map(x => ({ g: x && x.g ? Number(x.g) : '', m: /^[TQ-]$/.test(x && x.m) ? x.m : '-' }));
+    while (t.length < 4) t.push({ g: '', m: '-' });
+    return { t, c: o.c === undefined ? 1 : Number(o.c), e: o.e || {} };
+  } catch (e) { return null; }
 }
-function sf10Set(key, i, v) {
-  const l = (learnersOf(SF10.secId) || []).find(x => x.key === key);
-  const sec = S.sectionMap[SF10.secId];
-  const code = sf10CodeOf(sec, l).split('');
-  code[i] = v;
-  SF10.codes[key] = code.join('');
+function sf10Rec(sec, l) {
+  if (!SF10.recs[l.key]) SF10.recs[l.key] = sf10Parse(l.sf10, sec) || sf10Def(sec);
+  return SF10.recs[l.key];
+}
+function sf10Json(rec) { return JSON.stringify({ t: rec.t, c: rec.c, e: rec.e }); }
+function sf10Dirty(learners, sec) {
+  return learners.some(l => SF10.recs[l.key] && sf10Json(SF10.recs[l.key]) !== sf10Json(sf10Parse(l.sf10, sec) || sf10Def(sec)));
 }
 /* "DELA CRUZ, JUAN BONIFACIO JR." → last, first, middle and the name extension */
 function sf10Name(l) {
@@ -3699,11 +3740,19 @@ function sf10Name(l) {
   const middle = parts.length > 1 ? parts.pop() : '';
   return { last: CR.upper(last.trim()), first: CR.upper(parts.join(' ')), middle: CR.upper(middle), ext: CR.upper(ext) };
 }
+function sf10Full(l) {
+  const n = sf10Name(l);
+  return [n.last, [n.first, n.middle].filter(Boolean).join(' ')].filter(Boolean).join(', ') + (n.ext ? ' ' + n.ext : '');
+}
 function sf10Date(v) { const m = String(v || '').match(/^(\d{4})-(\d{2})-(\d{2})$/); return m ? `${m[2]}/${m[3]}/${m[1]}` : ''; }
+function sf10Tick(on) { return `<span class="cb${on ? ' on' : ''}">${on ? '✓' : ''}</span>`; }
+function sf10Fld(lab, val, g, chars) {
+  return `<span class="f g${g}">${lab ? `<i>${lab}</i>` : ''}<b${fitText(val, chars || 22)}>${esc(val || '')}</b></span>`;
+}
 
 /* ------------------------------------------------------------ blocks */
-function sf10Mast() {
-  const st = S.settings;
+function sf10Mast(l, rec) {
+  const n = sf10Name(l), e = rec.e || {};
   return `<div class="s10-mast"><div class="sfid">SF10-JHS</div>
     <img class="seal" src="${SF9_DEPED}" alt="">
     <div class="t"><i>Republic of the Philippines</i><i>Department of Education</i>
@@ -3711,37 +3760,36 @@ function sf10Mast() {
     <img class="mark" src="${SF10_DEPED_MARK}" alt=""></div>
   <div class="s10-band">LEARNER'S INFORMATION</div>
   <div class="s10-box">
-    <div class="r"><span class="f g3"><i>LAST NAME:</i><b>${esc(sf10Name(SF10.cur).last)}</b></span><span class="f g3"><i>FIRST NAME:</i><b>${esc(sf10Name(SF10.cur).first)}</b></span><span class="f g2"><i>NAME EXT. (Jr,I,II):</i><b>${esc(sf10Name(SF10.cur).ext)}</b></span><span class="f g3"><i>MIDDLE NAME:</i><b>${esc(sf10Name(SF10.cur).middle)}</b></span></div>
-    <div class="r"><span class="f g4"><i>Learner Reference Number (LRN):</i><b>${esc((SF10.cur && SF10.cur.lrn) || '')}</b></span><span class="f g4"><i>Birthdate (mm/dd/yyyy):</i><b>${esc(sf10Date(SF10.cur && SF10.cur.bday))}</b></span><span class="f g2"><i>Sex:</i><b>${SF10.cur && SF10.cur.sex === 'F' ? 'FEMALE' : 'MALE'}</b></span></div>
+    <div class="r">${sf10Fld('LAST NAME:', n.last, 3, 24)}${sf10Fld('FIRST NAME:', n.first, 3, 24)}${sf10Fld('NAME EXT. (Jr,I,II):', n.ext, 2)}${sf10Fld('MIDDLE NAME:', n.middle, 3, 24)}</div>
+    <div class="r">${sf10Fld('Learner Reference Number (LRN):', l.lrn || '', 4)}${sf10Fld('Birthdate (mm/dd/yyyy):', sf10Date(l.bday), 4)}${sf10Fld('Sex:', l.sex === 'F' ? 'FEMALE' : 'MALE', 2)}</div>
   </div>
   <div class="s10-band">ELIGIBILITY FOR JHS ENROLMENT</div>
   <div class="s10-box">
-    <div class="r"><span class="cb"></span><span class="lb">Elementary School Completer</span><span class="f g3"><i>General Average:</i><b></b></span><span class="f g4"><i>Citation (if Any):</i><b></b></span></div>
-    <div class="r ind"><span class="f g4"><i>Name of Elementary School:</i><b></b></span><span class="f g2"><i>School ID:</i><b></b></span><span class="f g4"><i>Address of School:</i><b></b></span></div>
+    <div class="r">${sf10Tick(e.comp)}<span class="lb">Elementary School Completer</span>${sf10Fld('General Average:', e.ave, 2)}${sf10Fld('Citation (if Any):', e.cit, 4, 30)}</div>
+    <div class="r ind">${sf10Fld('Name of Elementary School:', e.sch, 4, 30)}${sf10Fld('School ID:', e.schid, 2)}${sf10Fld('Address of School:', e.addr, 4, 30)}</div>
     <div class="r"><i class="oc">Other Credential Presented</i></div>
-    <div class="r"><span class="cb"></span><span class="lb">PEPT Passer</span><span class="f g2"><i>Rating:</i><b></b></span><span class="cb"></span><span class="lb">ALS A &amp; E Passer</span><span class="f g2"><i>Rating:</i><b></b></span><span class="cb"></span><span class="lb">Others (Pls. Specify):</span><span class="f g2"><b></b></span></div>
-    <div class="r ind"><span class="f g4"><i>Date of Examination/Assessment (mm/dd/yyyy):</i><b></b></span><span class="f g6"><i>Name and Address of Testing Center:</i><b></b></span></div>
+    <div class="r">${sf10Tick(e.pept)}<span class="lb">PEPT Passer</span>${sf10Fld('Rating:', e.peptR, 2)}${sf10Tick(e.als)}<span class="lb">ALS A &amp; E Passer</span>${sf10Fld('Rating:', e.alsR, 2)}${sf10Tick(e.oth)}<span class="lb">Others (Pls. Specify):</span>${sf10Fld('', e.othT, 2)}</div>
+    <div class="r ind">${sf10Fld('Date of Examination/Assessment (mm/dd/yyyy):', e.date, 4)}${sf10Fld('Name and Address of Testing Center:', e.center, 6, 40)}</div>
   </div>`;
 }
-function sf10Cont() {
-  const n = sf10Name(SF10.cur);
-  return `<div class="s10-cont"><span class="f grow"><i class="big">NAME:</i><span class="nm"><b>${esc([n.last, n.first, n.middle].filter(Boolean).join(', '))}</b><u><em>Last Name</em><em>First Name</em><em>Middle Name</em></u></span></span>
-    <span class="f lrn"><i class="big">LRN:</i><b>${esc((SF10.cur && SF10.cur.lrn) || '')}</b></span></div>`;
+function sf10Cont(l) {
+  return `<div class="s10-cont"><span class="f grow"><i class="big">NAME:</i><span class="nm"><b${fitText(sf10Full(l), 40)}>${esc(sf10Full(l))}</b><u><em>Last Name</em><em>First Name</em><em>Middle Name</em></u></span></span>
+    <span class="f lrn"><i class="big">LRN:</i><b>${esc(l.lrn || '')}</b></span></div>`;
 }
 
-/* one grade level: the meta rows, the ratings table and the remedial-class table */
-function sf10Table(sec, l, grade, mode, G) {
+/* one scholastic table: the meta rows, the ratings and the remedial-class table */
+function sf10Table(sec, l, tbl, G, fill) {
   const st = S.settings;
-  const cols = mode === 'Q' ? 4 : 3;
-  const here = grade === sec.grade;            // the year this site holds the class records for
-  const row = here && G && G[l.key] ? G[l.key] : null;
+  const grade = tbl.g || '';
+  const cols = tbl.m === 'Q' ? 4 : 3;
+  const row = fill && G && G[l.key] ? G[l.key] : null;
   const val = (code, i) => {
-    if (!row || !row[code] || mode === 'Q') return '';   // four-quarter years are filled in by hand
+    if (!row || !row[code] || tbl.m === 'Q') return '';   // four-quarter years are filled in by hand
     const v = i < 3 ? row[code].t[i] : row[code].fin;
     return v === null || v === undefined ? '' : v;
   };
   const gen = i => {
-    if (!row || mode === 'Q') return '';
+    if (!row || tbl.m === 'Q') return '';
     const v = SF10_AREAS.map(x => val(x[0], i)).filter(x => x !== '');
     return v.length === SF10_AREAS.length ? Math.round(v.reduce((a, b) => a + Number(b), 0) / v.length) : '';
   };
@@ -3750,10 +3798,10 @@ function sf10Table(sec, l, grade, mode, G) {
     `<td class="fr">${val(code, 3)}</td><td class="rm"></td></tr>`;
   const blank = `<tr>${'<td class="la"></td>' + Array.from({ length: cols + 2 }, () => '<td></td>').join('')}</tr>`;
   return `<div class="s10-sr">
-    <div class="s10-meta"><span class="f g3"><i>School:</i><b>${esc(st.schoolFull)}</b></span><span class="f g2"><i>School ID:</i><b>${esc(st.schoolId)}</b></span><span class="f g2"><i>District:</i><b></b></span><span class="f g2"><i>Division:</i><b>${esc(sf9Title(st.division))}</b></span><span class="f g2"><i>Region:</i><b>${esc(st.region)}</b></span></div>
-    <div class="s10-meta"><span class="f g2"><i>Classified as Grade:</i><b>${grade}</b></span><span class="f g2"><i>Section:</i><b>${here ? esc(CR.upper(sec.name)) : ''}</b></span><span class="f g2"><i>School Year:</i><b>${here ? esc(st.schoolYear) : ''}</b></span><span class="f g3"><i>Name of Adviser/Teacher:</i><b>${here ? esc(adviserName(sec) || '') : ''}</b></span><span class="f g3"><i>Signature:</i><b></b></span></div>
+    <div class="s10-meta">${sf10Fld('School:', st.schoolFull, 4, 30)}${sf10Fld('School ID:', st.schoolId, 2)}${sf10Fld('District:', '', 2)}${sf10Fld('Division:', sf9Title(st.division), 2)}${sf10Fld('Region:', st.region, 2)}</div>
+    <div class="s10-meta">${sf10Fld('Classified as Grade:', String(grade), 2)}${sf10Fld('Section:', fill ? CR.upper(sec.name) : '', 2)}${sf10Fld('School Year:', fill ? st.schoolYear : '', 2)}${sf10Fld('Name of Adviser/Teacher:', fill ? (adviserName(sec) || '') : '', 5, 22)}${sf10Fld('Signature:', '', 3)}</div>
     <table class="s10-gr"><thead>
-      <tr><th class="la" rowspan="2">LEARNING AREAS</th><th colspan="${cols}">${mode === 'Q' ? 'Quarterly Rating' : 'Term Rating'}</th><th class="fr" rowspan="2">FINAL<br>RATING</th><th class="rm" rowspan="2">REMARKS</th></tr>
+      <tr><th class="la" rowspan="2">LEARNING AREAS</th><th colspan="${cols}">${tbl.m === 'Q' ? 'Quarterly Rating' : 'Term Rating'}</th><th class="fr" rowspan="2">FINAL<br>RATING</th><th class="rm" rowspan="2">REMARKS</th></tr>
       <tr>${Array.from({ length: cols }, (_, i) => `<th>${i + 1}</th>`).join('')}</tr></thead><tbody>
       ${SF10_AREAS.map(([c, lab]) => tr(lab, c)).join('')}
       ${SF10_PARTS.map(([c, lab]) => tr(lab, c, true)).join('')}
@@ -3766,13 +3814,12 @@ function sf10Table(sec, l, grade, mode, G) {
   </div>`;
 }
 
-function sf10Cert(sec, l, grade) {
-  const st = S.settings;
-  const n = sf10Name(l);
+/* the certification is general: only the learner's name and LRN are filled in */
+function sf10Cert(l) {
   return `<div class="s10-band">CERTIFICATION</div>
   <div class="s10-box cert">
-    <div class="r"><span class="tx">I CERTIFY that this is a true record of</span><span class="f g4"><b>${esc([n.last, n.first, n.middle].filter(Boolean).join(', '))}</b></span><span class="tx">with LRN</span><span class="f g2"><b>${esc(l.lrn || '')}</b></span><span class="tx">and that he/she is eligible for admission to Grade</span><span class="f g1"><b>${grade + 1 <= 12 ? grade + 1 : ''}</b></span></div>
-    <div class="r"><span class="f g4"><i>Name of School:</i><b>${esc(st.schoolFull)}</b></span><span class="f g2"><i>School ID:</i><b>${esc(st.schoolId)}</b></span><span class="f g3"><i>Last School Year Attended:</i><b>${grade === sec.grade ? esc(st.schoolYear) : ''}</b></span></div>
+    <div class="r"><span class="tx">I CERTIFY that this is a true record of</span>${sf10Fld('', sf10Full(l), 4, 34)}<span class="tx">with LRN</span>${sf10Fld('', l.lrn || '', 2)}<span class="tx">and that he/she is eligible for admission to Grade</span><span class="f g1"><b></b></span></div>
+    <div class="r"><span class="f g4"><i>Name of School:</i><b></b></span><span class="f g2"><i>School ID:</i><b></b></span><span class="f g3"><i>Last School Year Attended:</i><b></b></span></div>
     <div class="s10-sign"><div class="c"><div class="ln"></div><div class="cap">Date</div></div>
       <div class="c wide"><div class="ln"></div><div class="cap">Signature of Principal/School Head over Printed Name</div></div>
       <div class="c seal"><div class="cap">(Affix School Seal Here)</div></div></div>
@@ -3780,20 +3827,25 @@ function sf10Cert(sec, l, grade) {
 }
 
 /* ------------------------------------------------------------ pages */
+function sf10FillIndex(sec, rec) {
+  // the table this site holds the class records for: the last one set to the section's grade level
+  let idx = -1;
+  rec.t.forEach((t, i) => { if (Number(t.g) === sec.grade && t.m === 'T') idx = i; });
+  return idx;
+}
 function sf10PagesHtml(sec, learners, G) {
   const pw = 215.9, ph = 330.2, m = 10;
   const page = inner => `<div class="s10-page" style="width:${pw}mm;height:${ph - 0.6}mm;padding:${m}mm">${inner}</div>`;
   let html = '';
   learners.forEach(l => {
-    SF10.cur = l;
-    const code = sf10CodeOf(sec, l), t = code.slice(0, 4), c = code.slice(4);
+    const rec = sf10Rec(sec, l), fillAt = sf10FillIndex(sec, rec);
     const blocks = [];
-    SF10_GRADES.forEach((g, i) => { if (t[i] !== '-') blocks.push({ k: 'table', h: SF10_H.table, html: sf10Table(sec, l, g, t[i], G) }); });
-    SF10_GRADES.forEach((g, i) => { if (c[i] === '1') blocks.push({ k: 'cert', h: SF10_H.cert, html: sf10Cert(sec, l, g) }); });
-    let body = sf10Mast(), left = SF10_H.page - SF10_H.head, band = false, out = [];
+    rec.t.forEach((t, i) => { if (t.m !== '-') blocks.push({ k: 'table', h: SF10_H.table, html: sf10Table(sec, l, t, G, i === fillAt) }); });
+    for (let i = 0; i < (Number(rec.c) || 0); i++) blocks.push({ k: 'cert', h: SF10_H.cert, html: sf10Cert(l) });
+    let body = sf10Mast(l, rec), left = SF10_H.page - SF10_H.head, band = false, out = [];
     blocks.forEach(b => {
       const need = b.h + (b.k === 'table' && !band ? SF10_H.band : 0);
-      if (need > left) { out.push(body); body = sf10Cont(); left = SF10_H.page - SF10_H.cont; band = false; }
+      if (need > left) { out.push(body); body = sf10Cont(l); left = SF10_H.page - SF10_H.cont; band = false; }
       if (b.k === 'table' && !band) { body += '<div class="s10-band">SCHOLASTIC RECORD</div>'; left -= SF10_H.band; band = true; }
       body += b.html; left -= b.h;
     });
@@ -3802,8 +3854,50 @@ function sf10PagesHtml(sec, learners, G) {
   });
   return html;
 }
+function sf10Pages(sec, l) {
+  const rec = sf10Rec(sec, l);
+  const t = rec.t.filter(x => x.m !== '-').length, c = Number(rec.c) || 0;
+  let left = SF10_H.page - SF10_H.head, band = false, n = 1;
+  const step = (h, isT) => {
+    const need = h + (isT && !band ? SF10_H.band : 0);
+    if (need > left) { n++; left = SF10_H.page - SF10_H.cont; band = false; }
+    if (isT && !band) { left -= SF10_H.band; band = true; }
+    left -= h;
+  };
+  for (let i = 0; i < t; i++) step(SF10_H.table, true);
+  for (let i = 0; i < c; i++) step(SF10_H.cert, false);
+  return n;
+}
 
 /* ------------------------------------------------------------ view */
+function sf10TablePick(key, i, t) {
+  const cur = !t || t.m === '-' ? '-' : (t.g || '') + t.m;
+  let o = `<option value="-" ${cur === '-' ? 'selected' : ''}>not printed</option>`;
+  SF10_LEVELS.forEach(g => {
+    o += `<option value="${g}T" ${cur === g + 'T' ? 'selected' : ''}>Grade ${g} · 3 terms</option>`;
+    o += `<option value="${g}Q" ${cur === g + 'Q' ? 'selected' : ''}>Grade ${g} · 4 quarters</option>`;
+  });
+  return `<select data-s10t="${esc(key)}|${i}">${key === '*' ? '<option value="" selected>— leave as it is —</option>' : ''}${o}</select>`;
+}
+function sf10EditHtml(sec, l) {
+  const rec = sf10Rec(sec, l), e = rec.e || {};
+  const tx = (k, lab) => `<div class="field"><label>${lab}</label><input data-s10f="${esc(l.key)}|${k}" value="${esc(e[k] || '')}"></div>`;
+  const tk = (k, lab) => `<label class="cond-item"><input type="checkbox" data-s10f="${esc(l.key)}|${k}" ${e[k] ? 'checked' : ''}> ${lab}</label>`;
+  return `<div class="panel s10edit"><h3>Educational background <span class="sub">${esc(l.name)}</span><span class="spacer"></span><button class="btn ghost sm" id="s10Done">Done</button></h3>
+    <div class="panel-body">
+      <p class="hint" style="margin-top:0">Typed here and printed in the <b>Eligibility for JHS Enrolment</b> block of this learner's SF10. A tick prints as ✓ in the box. Press <b>Done</b> to see it in the preview, then <b>Save these settings</b> to keep it in the system.</p>
+      ${tk('comp', 'Elementary School Completer')}
+      <div class="two">${tx('ave', 'General Average')}${tx('cit', 'Citation (if any)')}</div>
+      <div class="two">${tx('sch', 'Name of Elementary School')}${tx('schid', 'Elementary School ID')}</div>
+      <div class="field"><label>Address of School</label><input data-s10f="${esc(l.key)}|addr" value="${esc(e.addr || '')}"></div>
+      <div class="hint" style="margin:14px 0 6px">OTHER CREDENTIAL PRESENTED</div>
+      <div class="two">${tk('pept', 'PEPT Passer')}${tx('peptR', 'PEPT rating')}</div>
+      <div class="two">${tk('als', 'ALS A &amp; E Passer')}${tx('alsR', 'ALS A &amp; E rating')}</div>
+      <div class="two">${tk('oth', 'Others')}${tx('othT', 'Others (please specify)')}</div>
+      <div class="two">${tx('date', 'Date of Examination/Assessment (mm/dd/yyyy)')}${tx('center', 'Name and Address of Testing Center')}</div>
+    </div></div>`;
+}
+
 async function viewSF10(secId, refresh = true) {
   const main = $('#main');
   const secs = cardSections();
@@ -3815,21 +3909,24 @@ async function viewSF10(secId, refresh = true) {
     await ensureSummaries(true);
   }
   const keepY = main.scrollTop;
-  if (SF10.secId !== sec.id) { SF10.secId = sec.id; SF10.sel = {}; SF10.codes = {}; }
+  if (SF10.secId !== sec.id) { SF10.secId = sec.id; SF10.sel = {}; SF10.recs = {}; SF10.editKey = null; }
   const G = sectionGrades(sec.id);
   const learners = learnersOf(sec.id);
   learners.forEach(l => { if (SF10.sel[l.key] === undefined) SF10.sel[l.key] = true; });
   const chosen = learners.filter(l => SF10.sel[l.key]);
-  const dirty = Object.keys(SF10.codes).some(k => SF10.codes[k] !== ((learners.find(x => x.key === k) || {}).sf10 || ''));
-  const pick = (key, i, cur) => `<select data-s10t="${esc(key)}|${i}">${key === '*' ? '<option value="" selected>— leave as they are —</option>' : ''}<option value="T" ${cur === 'T' ? 'selected' : ''}>3 terms</option><option value="Q" ${cur === 'Q' ? 'selected' : ''}>4 quarters</option><option value="-" ${cur === '-' ? 'selected' : ''}>not printed</option></select>`;
+  const dirty = sf10Dirty(learners, sec);
+  const noB = chosen.filter(l => !l.bday).length;
+  const certPick = (key, cur) => `<select data-s10c="${esc(key)}">${key === '*' ? '<option value="" selected>— leave as it is —</option>' : ''}${[0, 1, 2, 3, 4].map(n => `<option value="${n}" ${String(cur) === String(n) ? 'selected' : ''}>${n === 0 ? 'none' : n}</option>`).join('')}</select>`;
   const rows = chosen.map(l => {
-    const code = sf10CodeOf(sec, l), t = code.slice(0, 4), c = code.slice(4);
-    const pages = Math.max(1, Math.ceil(((t.split('').filter(x => x !== '-').length * SF10_H.table) + (c.split('').filter(x => x === '1').length * SF10_H.cert) + SF10_H.head) / SF10_H.page));
-    return `<tr><td class="nm">${esc(l.name)}</td>${SF10_GRADES.map((g, i) => `<td>${pick(l.key, i, t[i])}</td>`).join('')}
-      ${SF10_GRADES.map((g, i) => `<td class="c"><input type="checkbox" data-s10c="${esc(l.key)}|${i}" ${c[i] === '1' ? 'checked' : ''}></td>`).join('')}
-      <td class="c">${pages}</td></tr>`;
+    const rec = sf10Rec(sec, l);
+    const done = Object.keys(rec.e || {}).length;
+    return `<tr${SF10.editKey === l.key ? ' class="on"' : ''}><td class="nm">${esc(l.name)}</td>${rec.t.map((t, i) => `<td>${sf10TablePick(l.key, i, t)}</td>`).join('')}
+      <td class="c">${certPick(l.key, rec.c)}</td>
+      <td class="c"><button class="btn ghost sm" data-s10ed="${esc(l.key)}">${done ? 'Edit ✓' : 'Fill in…'}</button></td>
+      <td class="c">${sf10Pages(sec, l)}</td></tr>`;
   }).join('');
   const col = sex => learners.filter(l => l.sex === sex).map(l => `<label class="cond-item rcpick"><input type="checkbox" data-s10sel="${esc(l.key)}" ${SF10.sel[l.key] ? 'checked' : ''}> ${esc(l.name)}</label>`).join('');
+  const edit = SF10.editKey && learners.find(l => l.key === SF10.editKey);
   main.innerHTML = topbar('SF10 · Permanent Record', lede) + `
   <div class="wrap">
     <div class="panel">
@@ -3840,33 +3937,62 @@ async function viewSF10(secId, refresh = true) {
           <button class="btn ghost" id="s10Save" ${dirty ? '' : 'disabled'}>Save these settings</button></div>
       </div>
       <div class="panel-body">
-        <p class="hint" style="margin-top:0">${esc(sec.label)} · Adviser: ${esc(adviserName(sec) || '—')} · ${chosen.length} of ${learners.length} learners selected.
-          Long bond (8.5 × 13 in), portrait, one learner at a time. Set below, for each learner, which of the four scholastic tables are printed and whether each is the <b>three-term</b> or the <b>four-quarter</b> form, and which certifications are printed.
-          Grade ${sec.grade} is filled in from the class records on this site; the other grade levels print blank, for the earlier records to be written in.
-          Four-quarter tables always print blank, because this site keeps three term grades.</p>
+        <p class="hint" style="margin-top:0">${esc(sec.label)} · Adviser: ${esc(adviserName(sec) || '—')} · ${chosen.length} of ${learners.length} learners selected. Long bond (8.5 × 13 in), portrait.
+          Each learner has four scholastic tables. Choose the <b>grade level</b> of each and whether it is the <b>three-term</b> or the <b>four-quarter</b> form, or leave it out — a learner who repeated a year simply has that grade on two tables.
+          Grade ${sec.grade} of this school year is filled in from the class records here; the other tables print blank, and a four-quarter table always prints blank because this site keeps three term grades.
+          The certification is general — only the name and the LRN are printed — and you choose how many blocks each learner gets.</p>
+        ${noB ? `<div class="note" style="margin:0 0 10px">${noB} selected learner${noB === 1 ? ' has' : 's have'} no birth date on file, so that box prints blank. Birth dates and LRNs come from the SF1 (School Register)${S.user.admin ? ' — upload it below' : '; ask the principal to upload it'}.</div>` : ''}
         <div class="two" style="gap:14px">
           <div><div class="hint">SET FOR EVERY SELECTED LEARNER AT ONCE</div>
-            <div class="s10all">${SF10_GRADES.map((g, i) => `<label>Grade ${g} table ${pick('*', i, '')}</label>`).join('')}
-              ${SF10_GRADES.map((g, i) => `<label class="cond-item"><input type="checkbox" data-s10ca="${i}"> Certification after Grade ${g}</label>`).join('')}</div></div>
+            <div class="s10all">${SF10_TABLES.map(i => `<label>Table ${i + 1} ${sf10TablePick('*', i, null)}</label>`).join('')}
+              <label>Certification blocks ${certPick('*', '')}</label></div></div>
           <div><details class="impdet"><summary>Choose learners</summary>
             <p><button class="btn ghost sm" data-s10all="1">Select all</button> <button class="btn ghost sm" data-s10all="0">Clear</button></p>
             <div class="two"><div><div class="hint">MALE</div>${col('M')}</div><div><div class="hint">FEMALE</div>${col('F')}</div></div>
           </details></div>
         </div>
         <div class="tbl-scroll" style="max-height:460px;margin-top:12px"><table class="grid tight s10set"><thead>
-          <tr><th rowspan="2">Learner</th><th colspan="4">Scholastic record table</th><th colspan="4">Certification</th><th rowspan="2">Pages</th></tr>
-          <tr>${SF10_GRADES.map(g => `<th>Grade ${g}</th>`).join('')}${SF10_GRADES.map(g => `<th class="c">G${g}</th>`).join('')}</tr>
+          <tr><th>Learner</th>${SF10_TABLES.map(i => `<th>Table ${i + 1}</th>`).join('')}<th class="c">Certifications</th><th class="c">Educational background</th><th class="c">Pages</th></tr>
         </thead><tbody>${rows}</tbody></table></div>
       </div>
     </div>
+    ${edit ? sf10EditHtml(sec, edit) : ''}
+    ${S.user.admin ? `<div class="panel"><h3>Update this class from its SF1 (School Register) <span class="sub">birth dates, LRNs, ages and the spelling of names</span></h3><div class="panel-body">
+      <div class="two"><div><div class="drop" id="sf1Drop"></div></div>
+        <div class="hint" style="margin:0"><p style="margin-top:0">The SF10 prints the learner's <b>birthdate</b> and <b>LRN</b>; both come from the SF1 generated through LIS. Upload the SF1 of this section (or of any other) and the site fills them in, writes every name the way the SF1 does and adds any learner missing from the roster. Nothing is saved until you press <b>Update</b>.</p></div></div>
+      <div id="sf1List" style="margin-top:14px"></div><div id="sf1Foot"></div>
+    </div></div>` : ''}
     <div class="panel"><h3>Preview <span class="sub">first learner</span></h3><div class="panel-body rcpreview" id="s10Preview"></div></div>
   </div>`;
+  if (S.user.admin) initSF1Panel();
   const prev = document.getElementById('s10Preview');
   const html = chosen.length ? sf10PagesHtml(sec, chosen.slice(0, 1), G) : '';
   const k = Math.min(1, (prev.clientWidth - 4) / (215.9 * 3.7795));
   const pages = (html.match(/class="s10-page"/g) || []).length || 1;
   prev.innerHTML = `<div class="rcscale" style="width:${215.9 * 3.7795 * k}px;height:${330.2 * 3.7795 * k * pages}px"><div style="transform:scale(${k});transform-origin:0 0">${html}</div></div>`;
   if (!refresh) main.scrollTop = keepY;
+}
+
+/* ------------------------------------------------------------ actions */
+function sf10Each(key, fn) {
+  const sec = S.sectionMap[SF10.secId];
+  if (!sec) return;
+  const ls = learnersOf(sec.id);
+  if (key === '*') ls.filter(l => SF10.sel[l.key]).forEach(l => fn(sf10Rec(sec, l), l));
+  else { const l = ls.find(x => x.key === key); if (l) fn(sf10Rec(sec, l), l); }
+}
+function sf10SetTable(key, i, v) {
+  sf10Each(key, rec => { rec.t[i] = v === '-' ? { g: rec.t[i].g, m: '-' } : { g: Number(v.slice(0, -1)), m: v.slice(-1) }; });
+}
+function sf10SetCert(key, v) { sf10Each(key, rec => { rec.c = Number(v); }); }
+function sf10SetField(key, field, value) {
+  sf10Each(key, rec => {
+    rec.e = rec.e || {};
+    if (value === true) rec.e[field] = 1;
+    else if (value === false) delete rec.e[field];
+    else if (String(value).trim()) rec.e[field] = String(value).trim();
+    else delete rec.e[field];
+  });
 }
 
 function sf10Host() {
@@ -3927,12 +4053,12 @@ async function saveSF10(btn) {
   const sec = S.sectionMap[SF10.secId];
   if (!sec) return;
   const values = {};
-  learnersOf(sec.id).forEach(l => { values[l.key] = sf10CodeOf(sec, l); });
+  learnersOf(sec.id).forEach(l => { values[l.key] = sf10Json(sf10Rec(sec, l)); });
   busy(btn, true, 'Saving…');
   try {
     const r = await api('saveSF10', { sectionId: sec.id, values });
     await loadAll();
-    SF10.codes = {};
+    SF10.recs = {};
     toast(`SF10 settings saved for ${r.saved} learner${r.saved === 1 ? '' : 's'} of ${sec.label}.`);
     viewSF10(sec.id, false);
   } catch (e) { toast(e.message, true); busy(btn, false); }
@@ -5764,6 +5890,7 @@ document.addEventListener('click', async e => {
   if (t.dataset.ssv) { SSV.period = t.dataset.ssv; viewSummary(SSV.secId, false); return; }
   if (t.dataset.s9) { SF9[t.dataset.s9] = t.dataset.s9 === 'upto' ? Number(t.dataset.v) : t.dataset.v; viewSF9(SF9.secId, false); return; }
   if (t.dataset.s9all) { learnersOf(SF9.secId).forEach(l => SF9.sel[l.key] = t.dataset.s9all === '1'); viewSF9(SF9.secId, false); return; }
+  if (t.dataset.s10ed) { SF10.editKey = SF10.editKey === t.dataset.s10ed ? null : t.dataset.s10ed; viewSF10(SF10.secId, false); return; }
   if (t.dataset.s10all) { learnersOf(SF10.secId).forEach(l => SF10.sel[l.key] = t.dataset.s10all === '1'); viewSF10(SF10.secId, false); return; }
   switch (t.id) {
     case 'connectBtn': {
@@ -5823,6 +5950,7 @@ document.addEventListener('click', async e => {
     case 'rcPdf': return downloadCardsPdf(t);
     case 'sf1Save': return saveSF1(t);
     case 'sf1Clear': SF1.items = []; drawSF1(); return;
+    case 's10Done': SF10.editKey = null; viewSF10(SF10.secId, false); return;
     case 's10Print': return printSF10();
     case 's10Pdf': return downloadSF10Pdf(t);
     case 's10Save': return saveSF10(t);
@@ -5842,6 +5970,10 @@ document.addEventListener('click', async e => {
 document.addEventListener('input', e => {
   if (e.target.closest && e.target.closest('#crTable')) onGridInput(e);
   if (e.target.dataset && e.target.dataset.cday !== undefined) drawDaysTotal();
+  if (e.target.dataset && e.target.dataset.s10f !== undefined) {
+    const [key, field] = e.target.dataset.s10f.split('|');
+    sf10SetField(key, field, e.target.type === 'checkbox' ? e.target.checked : e.target.value);
+  }
 });
 document.addEventListener('change', e => {
   if (e.target.closest && e.target.closest('#importList') && onImportChange(e)) return;
@@ -5851,23 +5983,18 @@ document.addEventListener('change', e => {
   if (e.target.dataset && e.target.dataset.s10sel !== undefined) { SF10.sel[e.target.dataset.s10sel] = e.target.checked; viewSF10(SF10.secId, false); return; }
   if (e.target.dataset && e.target.dataset.s10t !== undefined) {
     const [key, i] = e.target.dataset.s10t.split('|');
-    const sec = S.sectionMap[SF10.secId];
-    if (key === '*') { if (e.target.value) learnersOf(sec.id).filter(l => SF10.sel[l.key]).forEach(l => sf10Set(l.key, +i, e.target.value)); }
-    else sf10Set(key, +i, e.target.value);
+    if (key !== '*' || e.target.value) sf10SetTable(key, +i, e.target.value);
     viewSF10(SF10.secId, false); return;
   }
   if (e.target.dataset && e.target.dataset.s10c !== undefined) {
-    const [key, i] = e.target.dataset.s10c.split('|');
-    sf10Set(key, 4 + Number(i), e.target.checked ? '1' : '0');
+    if (e.target.dataset.s10c !== '*' || e.target.value !== '') sf10SetCert(e.target.dataset.s10c, e.target.value);
     viewSF10(SF10.secId, false); return;
   }
-  if (e.target.dataset && e.target.dataset.s10ca !== undefined) {
-    const i = Number(e.target.dataset.s10ca), on = e.target.checked ? '1' : '0';
-    learnersOf(SF10.secId).filter(l => SF10.sel[l.key]).forEach(l => sf10Set(l.key, 4 + i, on));
-    viewSF10(SF10.secId, false); return;
+  if (e.target.dataset && e.target.dataset.s10f !== undefined) {   // the eligibility form: keep the typing, redraw later
+    const [key, field] = e.target.dataset.s10f.split('|');
+    sf10SetField(key, field, e.target.type === 'checkbox' ? e.target.checked : e.target.value);
+    return;
   }
-  if (e.target.dataset && e.target.dataset.cday !== undefined) { drawDaysTotal(); return; }
-  if (e.target.dataset && e.target.dataset.secpick) { go('#/' + e.target.dataset.secpick + '/' + encodeURIComponent(e.target.value)); return; }
   if (e.target.id === 'showDesc') { C.showDesc = e.target.checked; drawClass(); }
   if (e.target.id === 'demoPick' && e.target.value) { $('#email').value = e.target.value; }
 });
