@@ -898,6 +898,51 @@ table.cr.remed td.nm{white-space:nowrap;text-align:left}
   body.print-cards .ptc-page{break-after:page;page-break-after:always}
   body.print-cards .ptc-page:last-child{break-after:auto;page-break-after:auto}
 }
+
+/* ------------------------------------- certificate of good moral character */
+.gm-page{position:relative;box-sizing:border-box;background:#fff;color:#000;overflow:hidden;
+  font-family:"Book Antiqua","Palatino Linotype",Palatino,"URW Palladio L","Liberation Serif",Georgia,serif}
+.gm-page>*{position:absolute}
+.gm-head{height:auto}
+.gm-rule{border-top:1.5pt solid #000}
+.gm-frule{border-top:.75pt solid #000}
+.gm-office{font-family:Calibri,Carlito,"Segoe UI",Arial,sans-serif;font-size:3.53mm;line-height:1.15}
+.gm-title{text-align:center;font-weight:700;font-size:6mm;line-height:1.15}
+.gm-date,.gm-to{font-size:4.23mm;line-height:1.2}
+.gm-body{font-size:4.23mm;line-height:7.41mm;text-align:justify}
+.gm-body .gm-p{margin:0}
+.gm-body .in{display:inline-block;width:12.7mm}
+.gm-sign{font-size:4.23mm;line-height:4.95mm}
+.gm-sign .nt{margin-bottom:4.95mm}
+.gm-sign .nm{font-weight:700}
+.gm-seal{font-family:"Arial Narrow","Liberation Sans Narrow",Arial,sans-serif;font-size:4.23mm;line-height:5.8mm}
+.gm-flogo{height:auto}
+.gm-finfo{font-family:Calibri,Carlito,"Segoe UI",Arial,sans-serif;font-size:3.53mm;line-height:4.3mm;white-space:nowrap}
+@media print{
+  body.print-cards .gm-page{break-after:page;page-break-after:always}
+  body.print-cards .gm-page:last-child{break-after:auto;page-break-after:auto}
+}
+
+/* -------------------------------- certificate of completion, laid out for PDF */
+.cc-page{position:relative;box-sizing:border-box;background:#fff;color:#000;overflow:hidden;
+  font-family:"Bookman Old Style","URW Bookman","TeX Gyre Bonum","Bookman URW",Georgia,serif}
+.cc-page>*{position:absolute}
+.cc-seal{height:auto}
+.cc-l{left:0;width:297mm;text-align:center;line-height:1.1;white-space:nowrap}
+.cc-l.b{font-weight:700}
+.cc-l.it{font-style:italic}
+.cc-l sup{font-size:.58em;vertical-align:super}
+.cc-l.f8{font-size:2.82mm}.cc-l.f9{font-size:3.18mm}.cc-l.f10{font-size:3.53mm}
+.cc-l.f11{font-size:3.88mm}.cc-l.f12{font-size:4.23mm}.cc-l.f14{font-size:4.94mm}
+.cc-l.f16{font-size:5.64mm}.cc-l.f18{font-size:6.35mm}
+.cc-who{text-align:center;line-height:1.1}
+.cc-who .n{font-size:3.88mm;font-weight:700}
+.cc-who .f{font-size:3.88mm;margin-top:1.5mm}
+.cc-who .e{font-size:3.18mm;font-style:italic;margin-top:1.4mm}
+@media print{
+  body.print-cards .cc-page{break-after:page;page-break-after:always}
+  body.print-cards .cc-page:last-child{break-after:auto;page-break-after:auto}
+}
 </style>
 </head>
 <body>
@@ -1042,6 +1087,8 @@ var CR = (function () {
     cocDate: '',                                // the date the certificates are signed (empty = 30 March of the school year)
     lockTerms: [false, false, false],           // a locked term cannot be edited by the subject teachers
     ptcDates: {},                               // parent-teacher conference date per class per term: { sectionId: { '1': 'YYYY-MM-DD' } }
+    gmcDates: {},                               // date of issuance of the good-moral certificate, per class
+    gmcSign: {},                                // who signs it: { n1, t1, n2, t2 }
     weights: { FIL: [0.2, 0.5, 0.3], ENG: [0.2, 0.5, 0.3], MATH: [0.2, 0.5, 0.3], SCI: [0.2, 0.5, 0.3],
       AP: [0.2, 0.5, 0.3], TLE: [0.2, 0.6, 0.2], MAPEH: [0.2, 0.6, 0.2], VE: [0.2, 0.5, 0.3] },
     stWeights: [0.3, 0.3, 0.4],
@@ -1422,6 +1469,13 @@ var CR = (function () {
     }
     return v === undefined || v === null || v === '' ? fallback : v;
   }
+  /* a setting kept per class ({ sectionId: value }) only travels to the browser for the
+     school year it is looking at */
+  function bySection(all, settings, sy) {
+    var out = {};
+    Object.keys(all || {}).forEach(function (k) { if (inYear(settings, k, sy)) out[k] = all[k]; });
+    return out;
+  }
   function setPerYear(settings, key, sy, value) {
     var v = (settings || {})[key], out = {};
     if (v && typeof v === 'object' && !(v instanceof Array)) { Object.keys(v).forEach(function (k) { out[k] = v[k]; }); }
@@ -1575,12 +1629,8 @@ var CR = (function () {
       lockTerms: [1, 2, 3].map(function (t) { return termLocked(dir.settings, t, sy); }),
       classDays: perYear(dir.settings, 'classDays', sy, DEFAULT_SETTINGS.classDays),
       cocDate: perYear(dir.settings, 'cocDate', sy, ''),
-      ptcDates: (function () {
-        /* only this year's conference dates travel to the browser */
-        var all = dir.settings.ptcDates || {}, out = {};
-        Object.keys(all).forEach(function (k) { if (inYear(dir.settings, k, sy)) out[k] = all[k]; });
-        return out;
-      })()
+      ptcDates: bySection(dir.settings.ptcDates, dir.settings, sy),
+      gmcDates: bySection(dir.settings.gmcDates, dir.settings, sy)
     });
 
     if (action === 'signOut') {
@@ -1825,6 +1875,25 @@ var CR = (function () {
         }
         store.write('assignments', asg);
         log(store, env, email, 'teacher-changed', stSid + ' ' + stSubj + ' \u2192 ' + (tName || '(none)'));
+        return { ok: true };
+      });
+    }
+
+    if (action === 'saveGMC') {
+      /* the date of issuance of the certificate of good moral character, and who signs it */
+      var gmSid = clean(req.sectionId);
+      if (!(user.admin || user.head || isAdviser(user, gmSid) || teachesSection(user, gmSid)))
+        fail('Only the adviser or a teacher of this class can issue its certificates.', 'forbidden');
+      var gmSign = req.sign || {};
+      return env.withLock(function () {
+        var dates = dir.settings.gmcDates;
+        if (!dates || typeof dates !== 'object' || dates instanceof Array) dates = {};
+        var dv = clean(req.date);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dv)) dates[gmSid] = dv; else delete dates[gmSid];
+        var sign = {};
+        ['n1', 't1', 'n2', 't2'].forEach(function (k) { sign[k] = clean(gmSign[k]).slice(0, 80); });
+        saveSettingsRows(store, { gmcDates: dates, gmcSign: sign });
+        log(store, env, email, 'gmc-set', gmSid + ' ' + (dates[gmSid] || '(no date)'));
         return { ok: true };
       });
     }
@@ -3672,6 +3741,19 @@ function onSF1Change(e) {
   return false;
 }
 
+/* a click-or-drop file box: the element already carries its own wording and hidden input */
+function initDropBox(id, onFiles) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const input = el.querySelector('input[type="file"]');
+  if (!input) return;
+  el.onclick = () => input.click();
+  input.onchange = () => { if (input.files.length) onFiles([...input.files]); input.value = ''; };
+  el.ondragover = e => { e.preventDefault(); el.classList.add('over'); };
+  el.ondragleave = () => el.classList.remove('over');
+  el.ondrop = e => { e.preventDefault(); el.classList.remove('over'); if (e.dataTransfer.files.length) onFiles([...e.dataTransfer.files]); };
+}
+
 function initSF1Panel() {
   const el = document.getElementById('sf1Drop');
   if (!el) return;
@@ -4254,7 +4336,7 @@ const SF10_PARTS = [['MA', 'Music and Arts'], ['PEH', 'Physical Education and He
 const SF10_BLANK = 5;                 // empty learning-area rows, as on the printed form
 const SF10_LEVELS = [7, 8, 9, 10];
 const SF10_TABLES = [0, 1, 2, 3];
-const SF10 = { secId: null, sel: {}, recs: {}, editKey: null };
+const SF10 = { secId: null, sel: {}, recs: {}, editKey: null, xl: null };
 
 /* heights used to decide what goes on which page, in mm (checked against the rendered form) */
 const SF10_H = { page: 310, head: 57, cont: 4, band: 5, table: 104, cert: 25 };
@@ -4469,7 +4551,7 @@ async function viewSF10(secId, refresh = true) {
     await ensureSummaries(true);
   }
   const keepY = main.scrollTop;
-  if (SF10.secId !== sec.id) { SF10.secId = sec.id; SF10.sel = {}; SF10.recs = {}; SF10.editKey = null; }
+  if (SF10.secId !== sec.id) { SF10.xl = null; SF10.secId = sec.id; SF10.sel = {}; SF10.recs = {}; SF10.editKey = null; }
   const G = sectionGrades(sec.id);
   const learners = learnersOf(sec.id);
   learners.forEach(l => { if (SF10.sel[l.key] === undefined) SF10.sel[l.key] = true; });
@@ -4517,6 +4599,7 @@ async function viewSF10(secId, refresh = true) {
       </div>
     </div>
     ${edit ? sf10EditHtml(sec, edit) : ''}
+    ${sf10XlPanel(sec)}
     ${S.user.admin ? `<div class="panel"><h3>Update this class from its SF1 (School Register) <span class="sub">birth dates, LRNs, ages and the spelling of names</span></h3><div class="panel-body">
       <div class="two"><div><div class="drop" id="sf1Drop"></div></div>
         <div class="hint" style="margin:0"><p style="margin-top:0">The SF10 prints the learner's <b>birthdate</b> and <b>LRN</b>; both come from the SF1 generated through LIS. Upload the SF1 of this section (or of any other) and the site fills them in, writes every name the way the SF1 does and adds any learner missing from the roster. Nothing is saved until you press <b>Update</b>.</p></div></div>
@@ -4525,6 +4608,7 @@ async function viewSF10(secId, refresh = true) {
     <div class="panel"><h3>Preview <span class="sub">first learner</span></h3><div class="panel-body rcpreview" id="s10Preview"></div></div>
   </div>`;
   if (S.user.admin) initSF1Panel();
+  initDropBox('s10XlDrop', files => sf10XlUpload(files));
   const prev = document.getElementById('s10Preview');
   const html = chosen.length ? sf10PagesHtml(sec, chosen.slice(0, 1), G) : '';
   const k = Math.min(1, (prev.clientWidth - 4) / (215.9 * 3.7795));
@@ -4622,6 +4706,179 @@ async function saveSF10(btn) {
     toast(`SF10 settings saved for ${r.saved} learner${r.saved === 1 ? '' : 's'} of ${sec.label}.`);
     viewSF10(sec.id, false);
   } catch (e) { toast(e.message, true); busy(btn, false); }
+}
+
+/* ================================================================
+   THE LEARNER'S INFORMATION AND ELIGIBILITY BLOCK, AS A WORKBOOK
+   The block that sits above Table 1 of the SF10 is more typing than
+   any other part of the form, so the adviser can take it away as an
+   Excel file, fill it in offline, and drop the same file back in.
+   Nothing but the columns below is read, and a blank cell leaves
+   whatever is already in the system alone.
+   ================================================================ */
+const SF10_XL = [
+  ['key', 'Key (do not change)', l => l.key],
+  ['name', 'Name of Learner', l => l.name],
+  ['sex', 'Sex', l => (l.sex === 'F' ? 'FEMALE' : 'MALE')],
+  ['lrn', 'LRN', l => l.lrn || ''],
+  ['bday', 'Date of Birth (yyyy-mm-dd)', l => l.bday || ''],
+  ['comp', 'Elementary School Completer (YES/NO)', (l, e) => (e.comp ? 'YES' : 'NO')],
+  ['ave', 'General Average', (l, e) => e.ave || ''],
+  ['cit', 'Citation (if any)', (l, e) => e.cit || ''],
+  ['sch', 'Name of Elementary School', (l, e) => e.sch || ''],
+  ['schid', 'Elementary School ID', (l, e) => e.schid || ''],
+  ['addr', 'Address of Elementary School', (l, e) => e.addr || ''],
+  ['pept', 'PEPT Passer (YES/NO)', (l, e) => (e.pept ? 'YES' : 'NO')],
+  ['peptR', 'PEPT Rating', (l, e) => e.peptR || ''],
+  ['als', 'ALS A & E Passer (YES/NO)', (l, e) => (e.als ? 'YES' : 'NO')],
+  ['alsR', 'ALS Rating', (l, e) => e.alsR || ''],
+  ['oth', 'Other Credential (YES/NO)', (l, e) => (e.oth ? 'YES' : 'NO')],
+  ['othT', 'Other Credential — please specify', (l, e) => e.othT || ''],
+  ['date', 'Date of Examination / Assessment (mm/dd/yyyy)', (l, e) => e.date || ''],
+  ['center', 'Name and Address of Testing Center', (l, e) => e.center || '']
+];
+const SF10_TICKS = ['comp', 'pept', 'als', 'oth'];
+const SF10_ETEXT = ['ave', 'cit', 'sch', 'schid', 'addr', 'peptR', 'alsR', 'othT', 'date', 'center'];
+
+function sf10XlName(sec) {
+  return `SF10 Learner Information ${sec.label} SY ${S.settings.schoolYear}.xlsx`.replace(/[\\/:*?"<>|]/g, '-');
+}
+function downloadSF10Xlsx() {
+  const sec = S.sectionMap[SF10.secId];
+  if (!sec) return;
+  const learners = learnersOf(sec.id);
+  const aoa = [
+    [`SF10 — LEARNER'S INFORMATION AND ELIGIBILITY FOR JHS ENROLMENT`],
+    [`${sectionTitle(sec)}  ·  ${S.settings.schoolFull}  ·  SY ${S.settings.schoolYear}`],
+    ['Fill in the blank cells and upload this same file back on the SF10 page. Do not change the Key column, and do not add or remove columns.'],
+    [],
+    SF10_XL.map(c => c[1])
+  ];
+  learners.forEach(l => { const e = sf10Rec(sec, l).e || {}; aoa.push(SF10_XL.map(c => c[2](l, e))); });
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = SF10_XL.map(c => ({ wch: Math.max(12, Math.min(38, c[1].length + 4)) }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'SF10 Information');
+  XLSX.writeFile(wb, sf10XlName(sec));
+  toast(`Downloaded the information sheet of ${learners.length} learner${learners.length === 1 ? '' : 's'}.`);
+}
+
+/* ---- reading the filled-in workbook back ---- */
+function sf10XlRead(wb) {
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  if (!ws) throw new Error('The workbook has no sheet.');
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false, raw: false, defval: '' });
+  let head = -1;
+  for (let i = 0; i < Math.min(rows.length, 20); i++) {
+    const r = (rows[i] || []).map(v => String(v || '').trim().toLowerCase());
+    if (r.indexOf('key (do not change)') >= 0 || (r.indexOf('name of learner') >= 0 && r.indexOf('lrn') >= 0)) { head = i; break; }
+  }
+  if (head < 0) throw new Error('This is not the SF10 information sheet — the header row with “Name of Learner” and “LRN” was not found.');
+  const cols = {};
+  (rows[head] || []).forEach((h, i) => {
+    const t = String(h || '').trim().toLowerCase();
+    const hit = SF10_XL.find(c => c[1].toLowerCase() === t);
+    if (hit) cols[hit[0]] = i;
+  });
+  const out = [];
+  for (let i = head + 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const get = k => (cols[k] === undefined ? '' : String(r[cols[k]] === undefined || r[cols[k]] === null ? '' : r[cols[k]]).trim());
+    if (!get('key') && !get('name') && !get('lrn')) continue;
+    out.push({ key: get('key'), name: get('name'), lrn: get('lrn'), bday: get('bday'),
+      e: Object.fromEntries(SF10_XL.filter(c => SF10_TICKS.concat(SF10_ETEXT).indexOf(c[0]) >= 0).map(c => [c[0], get(c[0])])) });
+  }
+  return out;
+}
+function sf10XlDate(v) {
+  const s = String(v || '').trim();
+  let m = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/.exec(s);
+  if (m) return `${m[1]}-${('0' + m[2]).slice(-2)}-${('0' + m[3]).slice(-2)}`;
+  m = /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/.exec(s);                 // mm/dd/yyyy, as the SF10 prints it
+  if (m) return `${m[3]}-${('0' + m[1]).slice(-2)}-${('0' + m[2]).slice(-2)}`;
+  return '';
+}
+function sf10XlPlan(sec, rows) {
+  const learners = learnersOf(sec.id);
+  const byKey = {}, byLrn = {}, byName = {};
+  learners.forEach(l => { byKey[l.key] = l; if (l.lrn) byLrn[String(l.lrn)] = l; byName[CR.nameKey(l.name)] = l; });
+  const plan = { hits: [], missed: [], lrn: 0, bday: 0, elig: 0 };
+  rows.forEach(r => {
+    const l = byKey[r.key] || (r.lrn && byLrn[String(r.lrn)]) || byName[CR.nameKey(r.name)];
+    if (!l) { plan.missed.push(r.name || r.lrn || r.key); return; }
+    const rec = sf10Rec(sec, l);
+    const e = Object.assign({}, rec.e || {});
+    let changed = false;
+    SF10_ETEXT.forEach(k => { const v = String(r.e[k] || '').trim(); if (v && v !== (e[k] || '')) { e[k] = v; changed = true; } });
+    SF10_TICKS.forEach(k => {
+      const v = String(r.e[k] || '').trim().toUpperCase();
+      if (!v) return;
+      const on = /^(Y|YES|TRUE|1|✓|X)$/.test(v);
+      if (!!e[k] !== on) { e[k] = on; changed = true; }
+    });
+    const lrn = String(r.lrn || '').replace(/[^0-9A-Za-z-]/g, '');
+    const bday = sf10XlDate(r.bday);
+    const hit = { l, e, changed, lrn: lrn && lrn !== String(l.lrn || '') ? lrn : '', bday: bday && bday !== String(l.bday || '') ? bday : '' };
+    if (hit.lrn) plan.lrn++;
+    if (hit.bday) plan.bday++;
+    if (changed) plan.elig++;
+    if (changed || hit.lrn || hit.bday) plan.hits.push(hit);
+  });
+  return plan;
+}
+async function sf10XlUpload(files) {
+  const sec = S.sectionMap[SF10.secId];
+  if (!sec || !files || !files.length) return;
+  SF10.xl = { status: 'reading', file: files[0].name };
+  viewSF10(sec.id, false);
+  try {
+    const wb = await readWorkbook(files[0]);
+    const rows = sf10XlRead(wb);
+    const plan = sf10XlPlan(sec, rows);
+    SF10.xl = { status: 'ready', file: files[0].name, rows: rows.length, plan };
+  } catch (e) { SF10.xl = { status: 'error', file: files[0].name, error: e.message }; }
+  viewSF10(sec.id, false);
+}
+async function sf10XlApply(btn) {
+  const sec = S.sectionMap[SF10.secId];
+  const xl = SF10.xl;
+  if (!sec || !xl || xl.status !== 'ready' || !xl.plan.hits.length) return;
+  busy(btn, true, 'Saving…');
+  try {
+    /* the LRN and the date of birth live with the learner; the eligibility block lives on the SF10 */
+    if (xl.plan.hits.some(h => h.lrn || h.bday)) {
+      const list = learnersOf(sec.id).map(l => {
+        const h = xl.plan.hits.find(x => x.l.key === l.key);
+        return { key: l.key, name: l.name, sex: l.sex, lrn: (h && h.lrn) || l.lrn || '',
+          age: l.age || '', bday: (h && h.bday) || l.bday || '', sf10: l.sf10 || '', remarks: l.remarks || '' };
+      });
+      await api('saveRoster', { sections: { [sec.id]: list } });
+    }
+    const values = {};
+    xl.plan.hits.forEach(h => { const rec = sf10Rec(sec, h.l); rec.e = h.e; });
+    learnersOf(sec.id).forEach(l => { values[l.key] = sf10Json(sf10Rec(sec, l)); });
+    await api('saveSF10', { sectionId: sec.id, values });
+    await loadAll();
+    SF10.recs = {}; SF10.xl = null;
+    toast(`Saved: ${xl.plan.elig} eligibility block${xl.plan.elig === 1 ? '' : 's'}, ${xl.plan.lrn} LRN${xl.plan.lrn === 1 ? '' : 's'}, ${xl.plan.bday} date${xl.plan.bday === 1 ? '' : 's'} of birth.`);
+    viewSF10(sec.id, false);
+  } catch (e) { toast(e.message, true); busy(btn, false); }
+}
+function sf10XlPanel(sec) {
+  const xl = SF10.xl;
+  const n = learnersOf(sec.id).length;
+  return `<div class="panel"><h3>Learner's information as an Excel file <span class="sub">the block above Table 1</span></h3><div class="panel-body">
+    <p class="hint" style="margin-top:0">Take the whole class away as a workbook — name, LRN, date of birth and every box of <b>Eligibility for JHS Enrolment</b> — fill it in at leisure, then drop the same file back here. A cell left blank keeps whatever is already in the system, so nothing is lost.</p>
+    <p><button class="btn ghost" id="s10Xl">Download Excel (${n} learner${n === 1 ? '' : 's'})</button></p>
+    <div class="drop" id="s10XlDrop"><input type="file" accept=".xlsx,.xls" hidden><div class="big">Drop the filled-in workbook here</div><div class="sub">or click to choose the file</div></div>
+    ${!xl ? '' : xl.status === 'reading' ? `<div class="note" style="margin-top:10px">Reading ${esc(xl.file)}…</div>`
+      : xl.status === 'error' ? `<div class="note bad" style="margin-top:10px">${esc(xl.file)} — ${esc(xl.error)}</div>`
+      : `<div class="note ${xl.plan.hits.length ? 'info' : ''}" style="margin-top:10px">${esc(xl.file)} — ${xl.rows} row${xl.rows === 1 ? '' : 's'} read.
+          <b>${xl.plan.elig}</b> eligibility block${xl.plan.elig === 1 ? '' : 's'}, <b>${xl.plan.lrn}</b> LRN${xl.plan.lrn === 1 ? '' : 's'} and <b>${xl.plan.bday}</b> date${xl.plan.bday === 1 ? '' : 's'} of birth would change.
+          ${xl.plan.missed.length ? `<br>Not on this class list, so skipped: ${esc(xl.plan.missed.slice(0, 6).join(', '))}${xl.plan.missed.length > 6 ? ' and ' + (xl.plan.missed.length - 6) + ' more' : ''}.` : ''}
+          <p style="margin-bottom:0"><button class="btn" id="s10XlSave" ${xl.plan.hits.length ? '' : 'disabled'}>Update ${xl.plan.hits.length} learner${xl.plan.hits.length === 1 ? '' : 's'}</button>
+            <button class="btn ghost" id="s10XlCancel">Cancel</button></p></div>`}
+  </div></div>`;
 }
 </script>
 <script>
@@ -4867,11 +5124,12 @@ async function viewCOC(secId) {
       <div class="controls">
         ${sectionPicker('coc', secs, sec.id)}
         <div class="ctl"><label for="cocDate">Date signed</label><input type="date" id="cocDate" value="${esc(COC.date)}"></div>
-        <div class="ctl"><label>&nbsp;</label><button class="btn" id="cocDoc" ${chosen.length ? '' : 'disabled'}>Download ${chosen.length} certificate${chosen.length === 1 ? '' : 's'} (Word)</button></div>
+        <div class="ctl"><label>&nbsp;</label><button class="btn" id="cocPdf" ${chosen.length ? '' : 'disabled'}>Download one PDF (${chosen.length})</button>
+          <button class="btn ghost" id="cocDoc" ${chosen.length ? '' : 'disabled'}>Download Word file</button></div>
       </div>
       <div class="panel-body">
         <p class="hint" style="margin-top:0">${esc(sec.label)} · Adviser: ${esc(adviserName(sec) || '—')} · ${chosen.length} of ${learners.length} learners selected.
-          The file is the school's own template — same A4 landscape page, same margins, the same two seals in the same places, the same wording and type — with the learner's name, the LRN and the date filled in, one certificate per page. Open it in Word and print.</p>
+          The file is the school's own template — same A4 landscape page, same margins, the same two seals in the same places, the same wording and type — with the learner's name, the LRN and the date filled in, one certificate per page. <b>Download one PDF</b> gives every chosen learner's certificate in a single file, ready to print; the Word file is there for when something has to be edited first.</p>
         <div class="note info" style="margin:0 0 10px">Signed by <b>${esc(CR.upper(S.settings.principal || ''))}</b>, Punongguro / Principal, and <b>${esc(CR.upper(S.settings.sds || CR.DEFAULT_SETTINGS.sds))}</b>, Pansangay na Tagapamanihala ng mga Paaralan / Schools Division Superintendent.
           ${S.user.admin ? 'Both names are set in <b>Settings &amp; Activity</b>.' : 'Ask the principal to change the names in Settings.'}</div>
         ${noLrn ? `<div class="note" style="margin:0 0 10px">${noLrn} selected learner${noLrn === 1 ? ' has' : 's have'} no LRN on file, so that line prints blank. LRNs come from the SF1 (School Register).</div>` : ''}
@@ -4909,6 +5167,75 @@ function downloadCOC(btn) {
     toast('The certificate file could not be made (' + e.message + ').', true);
   } finally { busy(btn, false); }
 }
+
+/* ================================================================
+   The same certificate laid out for the screen, so every chosen
+   learner's certificate can come down as ONE PDF — the Word file
+   stays as it is, for when the school wants to edit before printing.
+   Every measurement is taken from the school's own template.
+   ================================================================ */
+const COC_PDF = {
+  pw: 297, ph: 210,
+  depedX: 29.1, depedY: 14.4, depedW: 40.4,     /* the seal on the left */
+  divX: 226.6, divY: 13.6, divW: 42.9,          /* the division seal on the right */
+  rows: { rp: 13.3, rpe: 18.8, ke: 23.3, dep: 29.5, reh: 38.2, reg: 43.7,
+    sangay: 52.0, div: 57.2, school: 65.7, pina: 76.8, cert: 82.1, name: 92.9,
+    lrn: 105.1, l1: 112.3, l1e: 122.0, l2: 128.9, l2e: 134.9,
+    katunayan: 145.7, certificate: 154.3, sign: 162.9, signE: 169.2,
+    who: 183.5, whoFil: 189.0, whoEng: 194.3 },
+  col1: 73.8, col2: 217.0                        /* where the two signatures are centred */
+};
+function cocPageHtml(sec, l, dp) {
+  const st = S.settings, C = COC_PDF, R = C.rows;
+  const line = (top, cls, text) => `<div class="cc-l ${cls}" style="top:${top}mm">${text}</div>`;
+  const fil = `Nilagdaan sa Lungsod ng Calamba, Laguna, Pilipinas nitong ika-${dp.day} ng ${COC_FIL_MONTHS[dp.mi]} ${dp.year}.`;
+  const eng = `Signed in Calamba City, Laguna, Philippines on the ${dp.day}<sup>${cocOrdinal(dp.day)}</sup> day of ${COC_ENG_MONTHS[dp.mi]} ${dp.year}.`;
+  const who = (x, name, fl, en) => `<div class="cc-who" style="left:${x - 74}mm;top:${R.who}mm;width:148mm">
+      <div class="n">${esc(name)}</div><div class="f">${esc(fl)}</div><div class="e">${esc(en)}</div></div>`;
+  return `<div class="cc-page" style="width:${C.pw}mm;height:${C.ph - 0.4}mm">
+    <img class="cc-seal" src="data:image/png;base64,${COC_DEPED_B64}" style="left:${C.depedX}mm;top:${C.depedY}mm;width:${C.depedW}mm" alt="">
+    <img class="cc-seal" src="data:image/png;base64,${COC_DIV_B64}" style="left:${C.divX}mm;top:${C.divY}mm;width:${C.divW}mm" alt="">
+    ${line(R.rp, 'f14', 'Republika ng Pilipinas')}
+    ${line(R.rpe, 'f10 it', 'Republic of the Philippines')}
+    ${line(R.ke, 'f16', 'Kagawaran ng Edukasyon')}
+    ${line(R.dep, 'f10 it', 'Department of Education')}
+    ${line(R.reh, 'f11 b', 'REHIYON IV-A')}
+    ${line(R.reg, 'f8 b it', 'REGION IV-A')}
+    ${line(R.sangay, 'f11 b', 'SANGAY NG LUNGSOD NG CALAMBA')}
+    ${line(R.div, 'f8 b it', 'DIVISION OF ' + esc(CR.upper(st.division || 'CALAMBA CITY')))}
+    ${line(R.school, 'f14 b', esc(CR.upper(st.schoolFull || '')))}
+    ${line(R.pina, 'f11', 'Pinatutunayan nito na si')}
+    ${line(R.cert, 'f9 it', 'This certifies that')}
+    ${line(R.name, 'f18 b', esc(cocName(l)))}
+    ${line(R.lrn, 'f10', 'Learner&rsquo;s Reference Number (LRN): ' + esc(l.lrn || ''))}
+    ${line(R.l1, 'f11', 'ay kasiya-siyang nakatupad sa mga kinakailangan sa Kurikulum ng Junior High School na itinakda para sa')}
+    ${line(R.l1e, 'f9 it', 'has satisfactorily completed the requirements of the Junior High School Curriculum as prescribed for')}
+    ${line(R.l2, 'f11', 'Mataas na Paaralan ng Kagawaran ng Edukasyon, kaya pinagkalooban siya nitong')}
+    ${line(R.l2e, 'f9 it', 'Secondary Schools of the Department of Education and is therefore awarded this')}
+    ${line(R.katunayan, 'f18 b', 'KATUNAYAN')}
+    ${line(R.certificate, 'f11 b it', 'CERTIFICATE')}
+    ${line(R.sign, 'f12', esc(fil))}
+    ${line(R.signE, 'f9 it', eng)}
+    ${who(C.col1, CR.upper(st.principal || ''), 'Punongguro', 'Principal')}
+    ${who(C.col2, CR.upper(st.sds || CR.DEFAULT_SETTINGS.sds), 'Pansangay na Tagapamanihala ng mga Paaralan', 'Schools Division Superintendent')}
+  </div>`;
+}
+function cocPagesHtml(sec, learners) {
+  const dp = cocDateParts();
+  return learners.map(l => cocPageHtml(sec, l, dp)).join('');
+}
+async function downloadCOCPdf(btn) {
+  const sec = S.sectionMap[COC.secId];
+  if (!sec) return;
+  const chosen = learnersOf(sec.id).filter(l => COC.sel[l.key]);
+  if (!chosen.length) return;
+  await certPdf(btn, {
+    html: cocPagesHtml(sec, chosen),
+    selector: '.cc-page', fmt: [210, 297], orient: 'landscape',
+    name: `Certificate of Completion ${sec.label}.pdf`,
+    done: `Downloaded one PDF with ${chosen.length} certificate${chosen.length === 1 ? '' : 's'}.`
+  });
+}
 </script>
 <script>
 /* Parent-Teacher Conference forms — artwork lifted straight from the school's own templates.
@@ -4937,10 +5264,10 @@ const PTC_FOOT_MARK_RATIO = 2.5939;
       to see about each of them.
    ================================================================ */
 const PTC_SLIP_MAX = 77;          /* a grade of 77 or below sends the parent to that subject teacher */
-const PTC_SLIP_ROWS = 8;          /* rows in the slip's table, as in the template (8 learning areas) */
+const PTC_SLIP_ROWS = 8;          /* the most a slip can hold: the eight learning areas */
 const PTC_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
   'July', 'August', 'September', 'October', 'November', 'December'];
-const PTC = { secId: null, term: null, tab: 'att', sel: {}, dates: {}, cuts: false };
+const PTC = { secId: null, term: null, tab: 'att', sel: {}, selTerm: null, dates: {}, cuts: false };
 
 /* ---------------------------------------------------------- dates */
 /* "2026-09-28" as the form prints it: September 28, 2026 */
@@ -5068,11 +5395,10 @@ function ptcSlipHtml(sec, l, G, term, showGrades) {
   const P = PTC_SLIP;
   const w = P.cols.reduce((a, b) => a + b, 0);
   const rows = l ? ptcSlipRows(sec, l, G, term) : [];
-  const body = [];
-  for (let i = 0; i < PTC_SLIP_ROWS; i++) {
-    const r = rows[i];
-    body.push(`<tr style="height:${P.row}mm"><td class="sj">${r ? esc(r.label) : ''}</td><td class="rt">${r ? r.grade : ''}</td><td class="tc"${r ? fitText(r.teacher, 24) : ''}>${r ? esc(r.teacher) : ''}</td><td></td></tr>`);
-  }
+  /* one row per learning area at 77 or below — the table stops there, with no empty lines to cross out */
+  const body = rows.slice(0, PTC_SLIP_ROWS).map(r =>
+    `<tr style="height:${P.row}mm"><td class="sj">${esc(r.label)}</td><td class="rt">${r.grade}</td><td class="tc"${fitText(r.teacher, 24)}>${esc(r.teacher)}</td><td></td></tr>`);
+  if (!body.length) body.push(`<tr style="height:${P.row}mm"><td class="sj"></td><td class="rt"></td><td class="tc"></td><td></td></tr>`);
   if (!l) return `<div class="ptc-slip blank" style="height:${ptcSlipHeight()}mm"></div>`;
   return `<div class="ptc-slip" style="height:${ptcSlipHeight()}mm;padding-left:${P.ml}mm">
     <div class="ps-body" style="width:${w}mm">
@@ -5113,12 +5439,15 @@ async function viewPTC(secId, refresh = true) {
     await ensureSummaries(true);
   }
   const keepY = main.scrollTop;
-  if (PTC.secId !== sec.id) { PTC.secId = sec.id; PTC.sel = {}; PTC.term = null; }
+  if (PTC.secId !== sec.id) { PTC.secId = sec.id; PTC.sel = {}; PTC.term = null; PTC.selTerm = null; }
   const G = sectionGrades(sec.id);
   if (!PTC.term) PTC.term = latestTerm(sec.id, G);
   const term = PTC.term;
   const learners = learnersOf(sec.id);
   const need = learners.filter(l => ptcSlipRows(sec, l, G, term).length);
+  /* the slips are worked out by the system: every learner with a learning area at 77 or below in
+     this term is picked automatically, and the choice is made again whenever the term changes */
+  if (PTC.selTerm !== term) { PTC.sel = {}; PTC.selTerm = term; }
   learners.forEach(l => { if (PTC.sel[l.key] === undefined) PTC.sel[l.key] = need.indexOf(l) >= 0; });
   const chosen = learners.filter(l => PTC.sel[l.key]);
   const d = ptcDates(sec.id);
@@ -5242,6 +5571,229 @@ async function ptcPdf(btn, kind) {
       : `Conference Slips ${sec.label} Term ${PTC.term}.pdf`;
     pdf.save(nm.replace(/[\\/:*?"<>|]/g, '-'));
     toast(att ? `Downloaded the attendance sheet of ${sec.label}.` : `Downloaded ${list.length} conference slip${list.length === 1 ? '' : 's'}.`);
+  } catch (e) {
+    toast('The PDF could not be made on this computer (' + e.message + '). Use Print and choose “Save as PDF” instead — the layout is the same.', true);
+  } finally {
+    if (host) host.remove();
+    busy(btn, false);
+  }
+}
+</script>
+<script>
+/* ================================================================
+   CERTIFICATE OF GOOD MORAL CHARACTER
+   Built from the school's own template (Office of the School Guidance
+   Counselor). A4 portrait, one learner to a sheet.
+
+   The wording follows the learner: a boy's certificate reads "during
+   his stay ... he was ... he is ... the above-named alumnus", a girl's
+   reads "her ... she ... she ... alumna", exactly as the school's two
+   template files do. The date of issuance is set by the adviser on a
+   calendar, and both signatories can be changed and are kept in the
+   system.
+   ================================================================ */
+const GMC_SIGN = { n1: 'LIGAYA D. REANZARES', t1: 'Teacher Counselor', n2: '', t2: 'Principal I' };
+const GMC = { secId: null, sel: {}, date: {}, sign: null, dirty: false };
+
+/* A4 portrait, every measurement taken from the school's template */
+const GMC_GEO = {
+  pw: 210, ph: 297, ml: 25.4, mr: 25.4,
+  headTop: 10.0, headW: 124.9, headH: 38.06,   /* the school letterhead */
+  ruleY: 50.2, ruleW: 159.2,                    /* one inch in from each edge of the sheet */
+  officeY: 51.4,
+  titleY: 77.4,                                 /* C E R T I F I C A T I O N */
+  dateY: 89.0, dateX: 152.4,
+  toY: 98.4,
+  bodyY: 107.6, line: 7.41, indent: 12.7,       /* justified, 21 pt between lines */
+  signX: 114.3, sign1Y: 176.7, sign2Y: 196.5,
+  sealY: 232.7, sealX: 37.0,
+  footRuleY: 266.4, footLogoY: 268.6, footLogoX: 25.6, footLogoW: 17.1,
+  footTextX: 45.2, footTextY: 271.0, footLine: 4.3
+};
+
+function gmcSign() {
+  if (GMC.sign) return GMC.sign;
+  const saved = (S.settings || {}).gmcSign || {};
+  GMC.sign = {
+    n1: saved.n1 || GMC_SIGN.n1, t1: saved.t1 || GMC_SIGN.t1,
+    n2: saved.n2 || CR.upper((S.settings || {}).principal || ''), t2: saved.t2 || GMC_SIGN.t2
+  };
+  return GMC.sign;
+}
+function gmcSavedDate(secId) { return (((S.settings || {}).gmcDates) || {})[secId] || ''; }
+function gmcDate(secId) {
+  if (GMC.date[secId] === undefined) GMC.date[secId] = gmcSavedDate(secId);
+  return GMC.date[secId];
+}
+function gmcDirty(secId) {
+  const s = gmcSign(), saved = (S.settings || {}).gmcSign || {};
+  const signChanged = ['n1', 't1', 'n2', 't2'].some(k => (s[k] || '') !== (saved[k] || ''));
+  return signChanged || gmcDate(secId) !== gmcSavedDate(secId);
+}
+/* the certificate names the learner in full capitals, family name last */
+function gmcName(l) { return CR.upper(cocName(l)); }
+
+function gmcCertHtml(sec, l, dateLong) {
+  const st = S.settings, G = GMC_GEO, sg = gmcSign();
+  const he = l.sex === 'F' ? 'she' : 'he';
+  const his = l.sex === 'F' ? 'her' : 'his';
+  const alum = l.sex === 'F' ? 'alumna' : 'alumnus';
+  const body = [
+    `<p class="gm-p"><span class="in"></span>This is to certify that, as per records in this office, <b>${esc(gmcName(l))}</b> had been a regular student and a Grade ${esc(String(sec.grade))} Completer of this institution during the School Year ${esc(st.schoolYear)}.</p>`,
+    `<p class="gm-p"><span class="in"></span>This further certifies that during ${his} stay in this school, ${he} was observed to have followed all school rules and regulations. Thus, ${he} is presumed to possess good moral character.</p>`,
+    `<p class="gm-p"><span class="in"></span>This certification is issued upon request of the above-named ${alum} for whatever purpose it may serve.</p>`
+  ].join('');
+  return `<div class="gm-page" style="width:${G.pw}mm;height:${G.ph - 0.4}mm">
+    <img class="gm-head" src="${PTC_SLIP_HEAD}" style="left:${(G.pw - G.headW) / 2}mm;top:${G.headTop}mm;width:${G.headW}mm;height:${G.headH}mm" alt="">
+    <div class="gm-rule" style="left:${G.ml}mm;top:${G.ruleY}mm;width:${G.ruleW}mm"></div>
+    <div class="gm-office" style="left:${G.ml}mm;top:${G.officeY}mm">Office of the School Guidance Counselor</div>
+    <div class="gm-title" style="left:${G.ml}mm;top:${G.titleY}mm;width:${G.ruleW}mm">C E R T I F I C A T I O N</div>
+    <div class="gm-date" style="left:${G.dateX}mm;top:${G.dateY}mm">${esc(dateLong || '')}</div>
+    <div class="gm-to" style="left:${G.ml}mm;top:${G.toY}mm">To Whom It May Concern,</div>
+    <div class="gm-body" style="left:${G.ml}mm;top:${G.bodyY}mm;width:${G.ruleW}mm">${body}</div>
+    <div class="gm-sign" style="left:${G.signX}mm;top:${G.sign1Y}mm">
+      <div class="nm">${esc(sg.n1)}</div><div class="ti">${esc(sg.t1)}</div></div>
+    <div class="gm-sign" style="left:${G.signX}mm;top:${G.sign2Y}mm">
+      <div class="nt">Noted by:</div><div class="nm">${esc(sg.n2)}</div><div class="ti">${esc(sg.t2)}</div></div>
+    <div class="gm-seal" style="left:${G.sealX}mm;top:${G.sealY}mm">Not Valid Without<br>&nbsp;School Dry Seal</div>
+    <div class="gm-frule" style="left:${G.ml}mm;top:${G.footRuleY}mm;width:${G.ruleW}mm"></div>
+    <img class="gm-flogo" src="${SF9_CANHS}" style="left:${G.footLogoX}mm;top:${G.footLogoY}mm;width:${G.footLogoW}mm" alt="">
+    <div class="gm-finfo" style="left:${G.footTextX}mm;top:${G.footTextY}mm">
+      <div><b>Address:</b> ${esc(st.schoolAddress || '')}</div>
+      <div><b>Telephone No.:</b> 0960-379-7778 / 0995-859 - 4687</div>
+      <div><b>E-mail address:</b> ${esc(st.schoolId || '301527')}@deped.gov.ph</div>
+      <div><b>Facebook Page:</b> https://www.facebook.com/DepEdTayoCANHS${esc(st.schoolId || '301527')}</div>
+    </div>
+  </div>`;
+}
+function gmcPagesHtml(sec, learners) {
+  const dateLong = ptcLongDate(gmcDate(sec.id));
+  return learners.map(l => gmcCertHtml(sec, l, dateLong)).join('');
+}
+
+/* ------------------------------------------------------------ view */
+async function viewGMC(secId) {
+  const main = $('#main');
+  const secs = cardSections();
+  const lede = 'Certificate of Good Moral Character — the Guidance Office form, one learner to a sheet, with the date of issuance and the signatories set here.';
+  if (!secs.length) { main.innerHTML = topbar('Certificate of Good Moral Character', lede) + '<div class="wrap"><div class="note">No class is linked to your email yet.</div></div>'; return; }
+  const sec = S.sectionMap[secId] && secs.some(s => s.id === secId) ? S.sectionMap[secId] : secs[0];
+  if (GMC.secId !== sec.id) { GMC.secId = sec.id; GMC.sel = {}; }
+  const learners = learnersOf(sec.id);
+  learners.forEach(l => { if (GMC.sel[l.key] === undefined) GMC.sel[l.key] = false; });
+  const chosen = learners.filter(l => GMC.sel[l.key]);
+  const d = gmcDate(sec.id), long = ptcLongDate(d), sg = gmcSign();
+  const col = sex => learners.filter(l => l.sex === sex).map(l =>
+    `<label class="cond-item rcpick"><input type="checkbox" data-gmsel="${esc(l.key)}" ${GMC.sel[l.key] ? 'checked' : ''}> ${esc(l.name)}</label>`).join('');
+  main.innerHTML = topbar('Certificate of Good Moral Character', lede) + `
+  <div class="wrap">
+    <div class="panel">
+      <div class="controls">
+        ${sectionPicker('gmc', secs, sec.id)}
+        <div class="ctl"><label>Date of issuance</label><input type="date" id="gmDate" value="${esc(d)}"></div>
+        <div class="ctl"><label>&nbsp;</label><button class="btn" id="gmPrint" ${chosen.length ? '' : 'disabled'}>Print ${chosen.length || ''}</button>
+          <button class="btn ghost" id="gmPdf" ${chosen.length ? '' : 'disabled'}>Download one PDF</button>
+          <button class="btn ghost" id="gmSave" ${gmcDirty(sec.id) ? '' : 'disabled'}>Save</button></div>
+      </div>
+      <div class="panel-body">
+        <p class="hint" style="margin-top:0">${esc(sec.label)} &middot; Adviser: ${esc(adviserName(sec) || '—')} &middot; ${chosen.length} of ${learners.length} learners chosen.
+          ${long ? `The certificates carry the date <b>${esc(long)}</b>.` : 'Pick the date of issuance on the calendar above — it prints as, for example, July 11, 2023.'}
+          The wording follows each learner: <i>his / he / alumnus</i> for a boy, <i>her / she / alumna</i> for a girl.</p>
+        ${long ? '' : '<div class="note warn" style="margin:0 0 10px">No date of issuance is set yet, so the date line prints blank.</div>'}
+        <div class="two" style="gap:12px">
+          <div class="field"><label for="gmN1">Signatory 1 — name</label><input id="gmN1" value="${esc(sg.n1)}"></div>
+          <div class="field"><label for="gmT1">Signatory 1 — designation</label><input id="gmT1" value="${esc(sg.t1)}"></div>
+        </div>
+        <div class="two" style="gap:12px">
+          <div class="field"><label for="gmN2">Signatory 2 — name (Noted by)</label><input id="gmN2" value="${esc(sg.n2)}"></div>
+          <div class="field"><label for="gmT2">Signatory 2 — designation</label><input id="gmT2" value="${esc(sg.t2)}"></div>
+        </div>
+        <p class="hint">The names and designations are kept in the system once you press <b>Save</b>, so they stay the same for everyone until they are changed again.</p>
+        <details class="impdet" open><summary>Choose learners &middot; ${chosen.length} of ${learners.length} chosen</summary>
+          <p><button class="btn ghost sm" data-gmall="1">Select all</button> <button class="btn ghost sm" data-gmall="0">Clear</button></p>
+          <div class="two"><div><div class="hint">MALE</div>${col('M')}</div><div><div class="hint">FEMALE</div>${col('F')}</div></div>
+        </details>
+      </div>
+    </div>
+    <div class="panel"><h3>Preview <span class="sub">${chosen.length ? esc(chosen[0].name) : 'choose a learner'}</span></h3><div class="panel-body rcpreview" id="gmPreview"></div></div>
+  </div>`;
+  const prev = document.getElementById('gmPreview');
+  const G = GMC_GEO;
+  const k = Math.min(1, (prev.clientWidth - 4) / (G.pw * 3.7795));
+  const html = chosen.length ? gmcPagesHtml(sec, chosen.slice(0, 1)) : '';
+  prev.innerHTML = html
+    ? `<div class="rcscale" style="width:${G.pw * 3.7795 * k}px;height:${G.ph * 3.7795 * k}px"><div style="transform:scale(${k});transform-origin:0 0">${html}</div></div>`
+    : '<div class="empty-state">Tick a learner to see the certificate.</div>';
+}
+
+/* ---------------------------------------------------------- actions */
+function gmcSetSign(k, v) { gmcSign()[k] = v; }
+async function saveGMC(btn) {
+  const sec = S.sectionMap[GMC.secId];
+  if (!sec) return;
+  busy(btn, true, 'Saving…');
+  try {
+    await api('saveGMC', { sectionId: sec.id, date: gmcDate(sec.id), sign: gmcSign() });
+    await loadAll();
+    GMC.date = {}; GMC.sign = null;
+    toast('Date of issuance and signatories saved.');
+    viewGMC(sec.id);
+  } catch (e) { toast(e.message, true); busy(btn, false); }
+}
+function printGMC() {
+  const sec = S.sectionMap[GMC.secId];
+  if (!sec) return;
+  const chosen = learnersOf(sec.id).filter(l => GMC.sel[l.key]);
+  if (!chosen.length) return;
+  const host = sf9Host();
+  host.innerHTML = gmcPagesHtml(sec, chosen);
+  let ps = document.getElementById('cardPageStyle');
+  if (!ps) { ps = document.createElement('style'); ps.id = 'cardPageStyle'; document.head.appendChild(ps); }
+  ps.textContent = '@media print{@page{size:210mm 297mm;margin:0}}';
+  document.body.classList.add('print-cards');
+  const done = () => { document.body.classList.remove('print-cards'); ps.textContent = ''; host.innerHTML = ''; window.removeEventListener('afterprint', done); };
+  window.addEventListener('afterprint', done);
+  setTimeout(() => window.print(), 60);
+}
+async function downloadGMCPdf(btn) {
+  const sec = S.sectionMap[GMC.secId];
+  if (!sec) return;
+  const chosen = learnersOf(sec.id).filter(l => GMC.sel[l.key]);
+  if (!chosen.length) return;
+  await certPdf(btn, {
+    html: gmcPagesHtml(sec, chosen),
+    selector: '.gm-page', fmt: [210, 297], orient: 'portrait',
+    name: `Certificate of Good Moral Character ${sec.label}.pdf`,
+    done: `Downloaded one PDF with ${chosen.length} certificate${chosen.length === 1 ? '' : 's'}.`
+  });
+}
+
+/* one PDF holding every certificate that was chosen — shared by the
+   good-moral certificate and the certificate of completion */
+async function certPdf(btn, o) {
+  busy(btn, true, 'Preparing PDF…');
+  let host = null;
+  try {
+    await loadScriptOnce(['https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js', 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js'], () => !!window.html2canvas);
+    await loadScriptOnce(['https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js', 'https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js'], () => !!(window.jspdf && window.jspdf.jsPDF));
+    host = document.createElement('div');
+    host.style.cssText = 'position:fixed;left:-20000px;top:0;background:#fff;z-index:-1';
+    host.innerHTML = o.html;
+    document.body.appendChild(host);
+    if (document.fonts && document.fonts.ready) await document.fonts.ready;
+    const pdf = new window.jspdf.jsPDF({ orientation: o.orient, unit: 'mm', format: o.fmt, compress: true });
+    const pages = [...host.querySelectorAll(o.selector)];
+    for (let i = 0; i < pages.length; i++) {
+      btn.textContent = `Page ${i + 1} of ${pages.length}…`;
+      pages[i].style.height = (o.orient === 'landscape' ? o.fmt[0] : o.fmt[1]) + 'mm';
+      const canvas = await window.html2canvas(pages[i], { scale: 2.5, backgroundColor: '#ffffff', useCORS: true, logging: false });
+      if (i) pdf.addPage(o.fmt, o.orient);
+      const w = o.orient === 'landscape' ? o.fmt[1] : o.fmt[0];
+      const h = o.orient === 'landscape' ? o.fmt[0] : o.fmt[1];
+      pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, w, h);
+    }
+    pdf.save(o.name.replace(/[\\/:*?"<>|]/g, '-'));
+    toast(o.done);
   } catch (e) {
     toast('The PDF could not be made on this computer (' + e.message + '). Use Print and choose “Save as PDF” instead — the layout is the same.', true);
   } finally {
@@ -6155,6 +6707,7 @@ const NAV = () => {
     items.push({ id: 'sf9', label: 'SF9 · Performance Report' });
     items.push({ id: 'sf10', label: 'SF10 · Permanent Record' });
     items.push({ id: 'ptc', label: 'Parent-Teacher Conference' });
+    items.push({ id: 'gmc', label: 'Certificate of Good Moral' });
     if (cocSections().length) items.push({ id: 'coc', label: 'Certificate of Completion' });
   }
   if (S.user.admin) {
@@ -6250,6 +6803,7 @@ async function route() {
     else if (view === 'sf9') await viewSF9(parts[1]);
     else if (view === 'sf10') await viewSF10(parts[1]);
     else if (view === 'ptc') await viewPTC(parts[1]);
+    else if (view === 'gmc') await viewGMC(parts[1]);
     else if (view === 'coc') await viewCOC(parts[1]);
     else if (view === 'settings' && S.user.admin) await viewSettings();
     else await viewDash();
@@ -7500,6 +8054,7 @@ document.addEventListener('click', async e => {
   if (t.dataset.ssv) { SSV.period = t.dataset.ssv; viewSummary(SSV.secId, false); return; }
   if (t.dataset.s9) { SF9[t.dataset.s9] = t.dataset.s9 === 'upto' ? Number(t.dataset.v) : t.dataset.v; viewSF9(SF9.secId, false); return; }
   if (t.dataset.s9all) { learnersOf(SF9.secId).forEach(l => SF9.sel[l.key] = t.dataset.s9all === '1'); viewSF9(SF9.secId, false); return; }
+  if (t.dataset.gmall) { learnersOf(GMC.secId).forEach(l => GMC.sel[l.key] = t.dataset.gmall === '1'); viewGMC(GMC.secId); return; }
   if (t.dataset.cocall) { learnersOf(COC.secId).forEach(l => COC.sel[l.key] = t.dataset.cocall === '1'); viewCOC(COC.secId); return; }
   if (t.dataset.lock) { toggleLock(t); return; }
   if (t.dataset.syview) { pickYear(t.dataset.syview); return; }
@@ -7596,6 +8151,13 @@ document.addEventListener('click', async e => {
     case 'syCancel': SY.open = false; return route();
     case 'syCreate': return createSchoolYear(t);
     case 'ptcSave': return savePTCDate(t);
+    case 'gmSave': return saveGMC(t);
+    case 'gmPrint': return printGMC();
+    case 'gmPdf': return downloadGMCPdf(t);
+    case 'cocPdf': return downloadCOCPdf(t);
+    case 's10Xl': return downloadSF10Xlsx();
+    case 's10XlSave': return sf10XlApply(t);
+    case 's10XlCancel': SF10.xl = null; return viewSF10(SF10.secId, false);
     case 'ptcAttPrint': return ptcPrint('att');
     case 'ptcAttPdf': return ptcPdf(t, 'att');
     case 'ptcSlipPrint': return ptcPrint('slip');
@@ -7624,8 +8186,15 @@ document.addEventListener('input', e => {
     if (l) sf9Remarks(l)[term] = e.target.value;
   }
   if (e.target.id === 'syNew') SY.year = e.target.value;
+  if (/^gm[NT][12]$/.test(e.target.id || '')) gmcSetSign({ gmN1: 'n1', gmT1: 't1', gmN2: 'n2', gmT2: 't2' }[e.target.id], e.target.value);
 });
 document.addEventListener('change', e => {
+  /* the Section box on the report cards, remediation list, summary sheet, SF9, SF10, certificate
+     and conference pages: changing it opens that class */
+  if (e.target.dataset && e.target.dataset.secpick) {
+    go('#/' + e.target.dataset.secpick + '/' + encodeURIComponent(e.target.value));
+    return;
+  }
   if (e.target.closest && e.target.closest('#importList') && onImportChange(e)) return;
   if (e.target.closest && (e.target.closest('#sf1List') || e.target.closest('#sf1Foot')) && onSF1Change(e)) return;
   if (e.target.dataset && e.target.dataset.rcsel !== undefined) { RC.sel[e.target.dataset.rcsel] = e.target.checked; viewCards(RC.secId, false); return; }
@@ -7635,6 +8204,8 @@ document.addEventListener('change', e => {
   if (e.target.id === 'syPick') { pickYear(e.target.value); return; }
   if (e.target.id === 'syCopy') { SY.copy = e.target.checked; return; }
   if (e.target.dataset && e.target.dataset.ptcsel !== undefined) { PTC.sel[e.target.dataset.ptcsel] = e.target.checked; viewPTC(PTC.secId, false); return; }
+  if (e.target.dataset && e.target.dataset.gmsel !== undefined) { GMC.sel[e.target.dataset.gmsel] = e.target.checked; viewGMC(GMC.secId); return; }
+  if (e.target.id === 'gmDate') { GMC.date[GMC.secId] = e.target.value; viewGMC(GMC.secId); return; }
   if (e.target.id === 'ptcDate') { ptcDates(PTC.secId)[PTC.term] = e.target.value; viewPTC(PTC.secId, false); return; }
   if (e.target.id === 'ptcCuts') { PTC.cuts = e.target.checked; viewPTC(PTC.secId, false); return; }
   if (e.target.dataset && e.target.dataset.s9r !== undefined) {
