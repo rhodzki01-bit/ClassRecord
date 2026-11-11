@@ -130,14 +130,16 @@ html,body{height:100%}
 .tb-spacer{flex:1;min-width:12px}
 .tb-kicker{font-size:25.4px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;flex:none}
 
-#appBody{flex:1;min-height:0;display:grid;grid-template-columns:var(--rail) 1fr}
+#appBody{flex:1;min-height:0;display:grid;grid-template-columns:var(--rail) 1fr;grid-template-rows:minmax(0,1fr)}
 
+/* the side menu keeps to the height of the window and scrolls on its own, with its own scroll bar,
+   so the whole menu (school year, every item, sign out) can be reached without scrolling the page */
 #rail{
   background:var(--teal-deep);color:#D5E0EE;
   display:flex;flex-direction:column;
-  height:100%;
+  height:100%;min-height:0;overflow-y:auto;
 }
-.rail-head{padding:20px 20px 16px;border-bottom:1px solid rgba(255,255,255,.14)}
+.rail-head{flex:none;padding:20px 20px 16px;border-bottom:1px solid rgba(255,255,255,.14)}
 .rail-head .mark{font-family:var(--serif);font-size:23.1px;color:#fff;font-weight:600;letter-spacing:.01em}
 .rail-head .school{font-size:12.7px;color:#8FA6C0;margin-top:3px;line-height:1.35}
 .railyear{margin-top:8px}
@@ -148,7 +150,7 @@ html,body{height:100%}
 .syrow:last-child{border-bottom:0}
 .syrow .yr{font-weight:600;min-width:110px}
 .syrow .pill.now{background:var(--blue);color:#fff}
-#nav{flex:1;overflow:auto;padding:10px 0}
+#nav{flex:1 0 auto;padding:10px 0}
 .nav-group{padding:14px 20px 5px;font-size:12.1px;color:#E8B93B;letter-spacing:.06em}
 .nav-item{
   display:flex;align-items:center;gap:9px;width:100%;text-align:left;
@@ -158,7 +160,7 @@ html,body{height:100%}
 .nav-item:hover{background:rgba(255,255,255,.07);color:#fff}
 .nav-item.on{background:rgba(255,255,255,.12);color:#fff;border-left-color:#E8B93B;font-weight:600}
 .nav-item .ct{margin-left:auto;font-size:12.1px;color:#8FA6C0;font-variant-numeric:tabular-nums}
-.rail-foot{padding:11px 20px;border-top:1px solid rgba(255,255,255,.14);font-size:13.2px;color:#8FA6C0}
+.rail-foot{flex:none;padding:11px 20px;border-top:1px solid rgba(255,255,255,.14);font-size:13.2px;color:#8FA6C0}
 .rail-foot button{background:none;border:0;color:#B9CADC;cursor:pointer;padding:0;font-size:13.2px;text-decoration:underline}
 .rail-foot .who{margin-top:6px}
 .syncstate{display:flex;align-items:center;gap:7px;font-size:13.2px;color:#A9BDD3}
@@ -321,7 +323,7 @@ details.comp .inner{padding:14px}
   .ctl,.ctl select,.ctl input{min-width:0;width:100%}
   .ctl{flex:1 1 140px}
   .msf{min-width:0;flex:1 1 140px}
-  #rail{position:static;height:auto}
+  #rail{position:static;height:auto;overflow:visible}
   #nav{display:flex;overflow-x:auto;padding:0}
   .nav-group{display:none}
   .nav-item{border-left:0;border-bottom:3px solid transparent;white-space:nowrap;padding:11px 14px}
