@@ -1194,6 +1194,25 @@ var CR = (function () {
       sc: {} };
   }
 
+  /* how far a class record has got, without anybody's scores: for each of written work (ww) and
+     performance tasks (pt), how many highest possible scores are filled in, how many score columns
+     hold at least one score, and how many learners have at least one score */
+  function entryCounts(data) {
+    var d = data && data.ww ? data : emptyPart();
+    var filled = function (v) { return v !== '' && v !== null && v !== undefined; };
+    var one = function (comp, g) {
+      var hps = ((comp || {}).hps || []).filter(filled).length;
+      var learners = 0, cols = {};
+      Object.keys(d.sc || {}).forEach(function (k) {
+        var any = false;
+        (((d.sc[k] || {})[g]) || []).forEach(function (v, i) { if (filled(v)) { any = true; cols[i] = true; } });
+        if (any) learners++;
+      });
+      return { hps: hps, cols: Object.keys(cols).length, learners: learners };
+    };
+    return { ww: one(d.ww, 'w'), pt: one(d.pt, 'p') };
+  }
+
   /* One term of one class record (or one MAPEH component), exactly as the
      TERM sheet formulas compute it. Returns a row per learner key. */
   function validW(w) {
@@ -1727,6 +1746,24 @@ var CR = (function () {
       return { ok: true, records: rows };
     }
 
+    if (action === 'entryStatus') {
+      // counts only (no scores): whether written work and performance tasks have been entered in one term
+      // of every class record this person can view — for the WW & PT entry monitoring workbook
+      var esTerm = Number(req.term);
+      if ([1, 2, 3].indexOf(esTerm) < 0) fail('Unknown term.');
+      var esWant = {};
+      dir.assignments.forEach(function (a) {
+        if (!inYear(dir.settings, a.sectionId, sy) || !canView(user, a.sectionId, a.subject, dir.settings)) return;
+        (a.subject === 'MAPEH' ? ['MA', 'PEH'] : ['X']).forEach(function (p) { esWant[recordId(a.sectionId, a.subject, p, esTerm)] = true; });
+      });
+      var esRecs = store.recordAllFull ? store.recordAllFull() : store.recordFull(Object.keys(esWant));
+      return { ok: true, term: esTerm, records: esRecs.filter(function (r) { return esWant[r.id]; }).map(function (r) {
+        var c = entryCounts(r.data);
+        return { id: r.id, sectionId: r.sectionId, subject: r.subject, part: r.part, term: Number(r.term),
+          updatedAt: r.updatedAt || '', updatedBy: r.updatedBy || '', ww: c.ww, pt: c.pt };
+      }) };
+    }
+
     if (action === 'importRecords') {
       var items = req.records || [];
       return env.withLock(function () {
@@ -2105,7 +2142,7 @@ var CR = (function () {
     SUBJECTS: SUBJECTS, SUBJ: SUBJ, DEFAULT_SETTINGS: DEFAULT_SETTINGS, TRANSMU: TRANSMU, SCALE: SCALE, DEPED: DEPED,
     clean: clean, upper: upper, nameKey: nameKey, normEmail: normEmail, validEmail: validEmail,
     subjectCode: subjectCode, parseSection: parseSection, sectionId: sectionId, displayName: displayName, headSubjects: headSubjects,
-    r2: r2, r0: r0, num: num, termLocked: termLocked, transmute: transmute, band: band, descriptor: descriptor, emptyPart: emptyPart,
+    r2: r2, r0: r0, num: num, termLocked: termLocked, transmute: transmute, band: band, descriptor: descriptor, emptyPart: emptyPart, entryCounts: entryCounts,
     computePart: computePart, gradesOf: gradesOf, avgRound: avgRound, counts: counts,
     resolveUser: resolveUser, canEdit: canEdit, canView: canView, canViewAny: canViewAny, isAdviser: isAdviser, teachesSection: teachesSection,
     recordId: recordId, handle: handle, sanitizeData: sanitizeData,
@@ -2232,6 +2269,14 @@ var Store = {
     return rows.map(function (r) {
       var m = rowToMeta_(r);
       try { m.grades = JSON.parse(r[10] || '{}'); } catch (e) { m.grades = {}; }
+      try { m.data = JSON.parse(r.slice(11, 17).join('') || '{}'); } catch (e) { m.data = null; }
+      return m;
+    });
+  },
+  /* every record with its scores in one read of the sheet (recordFull reads row by row) */
+  recordAllFull: function () {
+    return recordRows_().filter(function (r) { return r[0]; }).map(function (r) {
+      var m = rowToMeta_(r);
       try { m.data = JSON.parse(r.slice(11, 17).join('') || '{}'); } catch (e) { m.data = null; }
       return m;
     });
@@ -6361,6 +6406,406 @@ if ('serviceWorker' in navigator && /^https?:/.test(location.protocol)) {
 </script>
 <script>
 /* ====================================================================
+   WW & PT entry monitoring
+   On demand, a workbook showing which subject teachers have entered at
+   least one Written Work (WW) and one Performance Task (PT) score in a
+   term: one tab per grade level (sections across the first row; Teacher,
+   WW and PT under each section in the second row), a Teachers tab and a
+   Details tab. Only counts are used, never a learner's scores.
+   The workbook is written here as Office Open XML and zipped with the
+   zip writer that ships inside SheetJS (XLSX.CFB), because the free
+   SheetJS cannot colour cells and the colours are what make it quick
+   to read.
+   ==================================================================== */
+const ENTRY = { term: null, running: false, msg: '' };
+
+/* the term teachers are working on: the latest one in which somebody other than an administrator
+   (whose saves are usually uploads of last term's Excel files) has saved a class record */
+function entryTermGuess() {
+  const admins = ((S.settings || {}).adminEmails || []).map(e => String(e).trim().toLowerCase());
+  let t = 1;
+  (S.records || []).forEach(m => {
+    const by = String(m.updatedBy || '').trim().toLowerCase(), term = Number(m.term);
+    if (by && admins.indexOf(by) < 0 && term > t && term <= 3) t = term;
+  });
+  return t;
+}
+
+/* counts for every class record on view, from the server in one call. A server that has not been
+   updated with this page's Code.gs does not know 'entryStatus' yet; then the class records are opened
+   one at a time instead (same counts, just slower). */
+async function fetchEntryStatus(term, progress) {
+  try {
+    const r = await api('entryStatus', { term });
+    return { records: r.records || [], fast: true };
+  } catch (e) {
+    if (!/Unknown action/i.test(String(e.message || ''))) throw e;
+  }
+  const list = S.assignments.filter(a => S.sectionMap[a.sectionId]);
+  const out = [];
+  let next = 0, done = 0;
+  const worker = async () => {
+    while (next < list.length) {
+      const a = list[next++];
+      let r;
+      for (let tries = 0; ; tries++) {
+        try { r = await api('getClass', { sectionId: a.sectionId, subject: a.subject }); break; }
+        catch (e) {
+          if (tries >= 2 || e.code === 'auth' || e.code === 'forbidden') throw e;
+          await new Promise(z => setTimeout(z, 1500));
+        }
+      }
+      (a.subject === 'MAPEH' ? ['MA', 'PEH'] : ['X']).forEach(p => {
+        const rec = (r.records || []).find(x => x.part === p && Number(x.term) === term);
+        if (!rec) return;
+        const c = CR.entryCounts(rec.data);
+        out.push({ id: rec.id || CR.recordId(a.sectionId, a.subject, p, term), sectionId: a.sectionId, subject: a.subject, part: p,
+          term, updatedAt: rec.updatedAt || '', updatedBy: rec.updatedBy || '', ww: c.ww, pt: c.pt });
+      });
+      if (progress) progress(++done, list.length);
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  return { records: out, fast: false };
+}
+
+const ENTRY_SHORT = { FIL: 'Filipino', ENG: 'English', MATH: 'Math', SCI: 'Science', AP: 'AP', TLE: 'TLE', VE: 'Values Ed' };
+const entryArea = (code, p) => code === 'MAPEH' ? (p === 'MA' ? 'MAPEH – Music & Arts' : 'MAPEH – PE & Health') : subjLabel(code);
+const entryAreaShort = (code, p) => code === 'MAPEH' ? (p === 'MA' ? 'MAPEH (Music & Arts)' : 'MAPEH (PE & Health)') : (ENTRY_SHORT[code] || subjLabel(code));
+const entryAreaOrder = (code, p) => {
+  const i = SUBJ_ORDER.indexOf(code);
+  return (i < 0 ? 99 : i) * 2 + (p === 'PEH' ? 1 : 0);
+};
+/* 'yes': at least one learner has a score; 'part': started, but fewer than half of the roster has one; 'no': none */
+const entryState = (c, n) => !c.learners ? 'no' : (n && c.learners < n / 2 ? 'part' : 'yes');
+
+/* one row per class record (MAPEH: one per component), in the order the site lists them */
+function entryRows(term, records) {
+  const byId = {};
+  records.forEach(r => { byId[r.id] = r; });
+  const zero = { hps: 0, cols: 0, learners: 0 };
+  const rows = [];
+  S.assignments.filter(a => S.sectionMap[a.sectionId]).forEach(a => {
+    const sec = S.sectionMap[a.sectionId];
+    const n = learnersOf(a.sectionId).length;
+    (a.subject === 'MAPEH' ? ['MA', 'PEH'] : ['X']).forEach(p => {
+      const r = byId[CR.recordId(a.sectionId, a.subject, p, term)] || {};
+      rows.push({ sec, a, part: p, n, area: entryArea(a.subject, p), ww: r.ww || zero, pt: r.pt || zero,
+        updatedAt: r.updatedAt || '', updatedBy: r.updatedBy || '' });
+    });
+  });
+  rows.sort((x, y) => x.sec.grade - y.sec.grade || S.sections.indexOf(x.sec) - S.sections.indexOf(y.sec)
+    || entryAreaOrder(x.a.subject, x.part) - entryAreaOrder(y.a.subject, y.part));
+  return rows;
+}
+
+/* per teacher: how many class records, how many with WW and with PT, and where each is missing */
+function entryTeachers(rows) {
+  const by = {};
+  rows.forEach(r => { (by[r.a.teacher] = by[r.a.teacher] || []).push(r); });
+  const where = r => r.sec.label.replace(/\s*-\s*/, '-') + ' ' + entryAreaShort(r.a.subject, r.part);
+  const list = Object.keys(by).map(name => {
+    const rs = by[name];
+    const ww = rs.filter(r => r.ww.learners > 0).length, pt = rs.filter(r => r.pt.learners > 0).length;
+    const status = ww === rs.length && pt === rs.length ? 'Has WW & PT in every class'
+      : !ww && !pt ? 'No WW or PT in any class' : 'Missing in some classes';
+    return { name, total: rs.length, ww, pt, status,
+      rank: status.charAt(0) === 'N' ? 0 : status.charAt(0) === 'M' ? 1 : 2,
+      wwMissing: rs.filter(r => !r.ww.learners).map(where).join(', '),
+      ptMissing: rs.filter(r => !r.pt.learners).map(where).join(', ') };
+  });
+  list.sort((x, y) => x.rank - y.rank || x.name.localeCompare(y.name));
+  return list;
+}
+
+/* ------------------------------------------------------------ a small styled .xlsx writer */
+const XW = (() => {
+  const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  const NSR = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const NSP = 'http://schemas.openxmlformats.org/package/2006/relationships';
+  const HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+  const esc = s => String(s == null ? '' : s).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g, '')
+    .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const col = c => { let s = ''; c++; while (c) { const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1) / 26); } return s; };
+  const ref = (r, c) => col(c) + (r + 1);
+  const abs = rng => rng.split(':').map(x => x.replace(/^([A-Z]+)(\d+)$/, '$$$1$$$2')).join(':');
+
+  const font = (o) => `<font>${o.b ? '<b/>' : ''}<sz val="${o.sz || 10}"/>${o.c ? `<color rgb="FF${o.c}"/>` : ''}<name val="Arial"/><family val="2"/></font>`;
+  const FONTS = [{}, { b: 1 }, { b: 1, c: 'FFFFFF' }, { b: 1, sz: 9, c: '1F3864' }, { sz: 9, c: '555555' }, { b: 1, sz: 13, c: '1F3864' },
+    { b: 1, sz: 11, c: '006100' }, { b: 1, sz: 11, c: '9C0006' }, { b: 1, sz: 11, c: '9C5700' }, { sz: 9 },
+    { b: 1, c: '006100' }, { b: 1, c: '9C0006' }, { b: 1, c: '9C5700' }, { c: '808080' }].map(font);
+  const solid = rgb => `<fill><patternFill patternType="solid"><fgColor rgb="FF${rgb}"/><bgColor indexed="64"/></patternFill></fill>`;
+  const FILLS = ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>']
+    .concat(['1F3864', 'D9E2F3', 'F2F2F2', 'FFF2CC', 'C6EFCE', 'FFC7CE', 'FFEB9C'].map(solid));
+  const side = n => `<${n} style="thin"><color rgb="FFBFBFBF"/></${n}>`;
+  const BORDERS = ['<border><left/><right/><top/><bottom/><diagonal/></border>',
+    `<border>${side('left')}${side('right')}${side('top')}${side('bottom')}<diagonal/></border>`];
+  /* name: [font, fill, border, alignment ('c' centre, 'l' left, '' none), number format] */
+  const XF = {
+    plain: [0, 0, 0, ''], head: [2, 2, 1, 'c'], sub: [3, 3, 1, 'c'], area: [1, 4, 1, 'l'], teacher: [9, 0, 1, 'l'],
+    yes: [6, 6, 1, 'c'], part: [8, 8, 1, 'c'], no: [7, 7, 1, 'c'], none: [13, 4, 1, 'c'],
+    footLabel: [1, 5, 1, 'l'], footNum: [1, 5, 1, 'c'], footBlank: [0, 5, 1, 'c'],
+    text: [0, 0, 1, 'l'], num: [0, 0, 1, 'c'], when: [0, 0, 1, 'c', 164], bold: [1, 0, 0, ''], small: [4, 0, 0, ''],
+    title: [5, 0, 0, ''], name: [1, 0, 1, 'l'], stGood: [10, 6, 1, 'l'], stBad: [11, 7, 1, 'l'], stPart: [12, 8, 1, 'l'],
+    numBad: [11, 0, 1, 'c']
+  };
+  const S_ = {};
+  Object.keys(XF).forEach((k, i) => { S_[k] = i; });
+  const stylesXml = () => {
+    const xf = Object.keys(XF).map(k => {
+      const [fo, fi, bo, al, nf] = XF[k];
+      const align = al === 'c' ? '<alignment horizontal="center" vertical="center" wrapText="1"/>'
+        : al === 'l' ? '<alignment horizontal="left" vertical="center" wrapText="1"/>' : '';
+      return `<xf numFmtId="${nf || 0}" fontId="${fo}" fillId="${fi}" borderId="${bo}" xfId="0"${nf ? ' applyNumberFormat="1"' : ''} applyFont="1" applyFill="1" applyBorder="1"${align ? ' applyAlignment="1">' + align + '</xf>' : '/>'}`;
+    }).join('');
+    return HEAD + `<styleSheet xmlns="${NS}"><numFmts count="1"><numFmt numFmtId="164" formatCode="mmm d, yyyy h:mm AM/PM"/></numFmts>`
+      + `<fonts count="${FONTS.length}">${FONTS.join('')}</fonts><fills count="${FILLS.length}">${FILLS.join('')}</fills>`
+      + `<borders count="${BORDERS.length}">${BORDERS.join('')}</borders>`
+      + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+      + `<cellXfs count="${Object.keys(XF).length}">${xf}</cellXfs>`
+      + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>';
+  };
+
+  function sheet(name) {
+    return {
+      name, cells: {}, merges: [], cols: {}, heights: {}, freeze: null, filter: null, maxR: 0, maxC: 0,
+      set(r, c, v, style) { this.cells[r + ',' + c] = { v, s: S_[style || 'plain'] || 0 }; this.maxR = Math.max(this.maxR, r); this.maxC = Math.max(this.maxC, c); return this; },
+      merge(r1, c1, r2, c2) { this.merges.push(ref(r1, c1) + ':' + ref(r2, c2)); },
+      width(c, w) { this.cols[c] = w; },
+      height(r, h) { this.heights[r] = h; }
+    };
+  }
+
+  function sheetXml(sh, first) {
+    const rows = {};
+    Object.keys(sh.cells).forEach(k => { const [r, c] = k.split(',').map(Number); (rows[r] = rows[r] || []).push(c); });
+    const data = Object.keys(rows).map(Number).sort((a, b) => a - b).map(r => {
+      const cells = rows[r].sort((a, b) => a - b).map(c => {
+        const { v, s } = sh.cells[r + ',' + c], at = `r="${ref(r, c)}"${s ? ` s="${s}"` : ''}`;
+        if (v === null || v === undefined || v === '') return `<c ${at}/>`;
+        if (v instanceof Date) return `<c ${at}><v>${(v.getTime() - v.getTimezoneOffset() * 60000) / 86400000 + 25569}</v></c>`;
+        if (typeof v === 'number') return `<c ${at}><v>${v}</v></c>`;
+        return `<c ${at} t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`;
+      }).join('');
+      return `<row r="${r + 1}"${sh.heights[r] ? ` ht="${sh.heights[r]}" customHeight="1"` : ''}>${cells}</row>`;
+    }).join('');
+    let pane = '';
+    if (sh.freeze) {
+      const { r, c } = sh.freeze, tl = ref(r, c);
+      const ap = r && c ? 'bottomRight' : r ? 'bottomLeft' : 'topRight';
+      pane = `<pane${c ? ` xSplit="${c}"` : ''}${r ? ` ySplit="${r}"` : ''} topLeftCell="${tl}" activePane="${ap}" state="frozen"/><selection pane="${ap}" activeCell="${tl}" sqref="${tl}"/>`;
+    }
+    const cols = Object.keys(sh.cols).map(Number).sort((a, b) => a - b)
+      .map(c => `<col min="${c + 1}" max="${c + 1}" width="${sh.cols[c]}" customWidth="1"/>`).join('');
+    return HEAD + `<worksheet xmlns="${NS}" xmlns:r="${NSR}"><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>`
+      + `<dimension ref="A1:${ref(sh.maxR, sh.maxC)}"/>`
+      + `<sheetViews><sheetView workbookViewId="0"${first ? ' tabSelected="1"' : ''}>${pane}</sheetView></sheetViews>`
+      + '<sheetFormatPr defaultRowHeight="15"/>' + (cols ? `<cols>${cols}</cols>` : '')
+      + `<sheetData>${data}</sheetData>`
+      + (sh.filter ? `<autoFilter ref="${sh.filter}"/>` : '')
+      + (sh.merges.length ? `<mergeCells count="${sh.merges.length}">${sh.merges.map(m => `<mergeCell ref="${m}"/>`).join('')}</mergeCells>` : '')
+      + '<pageMargins left="0.4" right="0.4" top="0.5" bottom="0.5" header="0.3" footer="0.3"/>'
+      + '<pageSetup orientation="landscape" fitToWidth="1" fitToHeight="0"/></worksheet>';
+  }
+
+  /* the zipped workbook, as bytes */
+  function book(sheets) {
+    const enc = new TextEncoder();
+    const zip = XLSX.CFB.utils.cfb_new();
+    const add = (path, text) => XLSX.CFB.utils.cfb_add(zip, path, enc.encode(text));
+    const CT = 'application/vnd.openxmlformats-officedocument.spreadsheetml.';
+    add('[Content_Types].xml', HEAD + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+      + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+      + '<Default Extension="xml" ContentType="application/xml"/>'
+      + `<Override PartName="/xl/workbook.xml" ContentType="${CT}sheet.main+xml"/>`
+      + sheets.map((s, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="${CT}worksheet+xml"/>`).join('')
+      + `<Override PartName="/xl/styles.xml" ContentType="${CT}styles+xml"/></Types>`);
+    add('_rels/.rels', HEAD + `<Relationships xmlns="${NSP}"><Relationship Id="rId1" Type="${NSR}/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
+    const names = sheets.map((s, i) => s.filter ? `<definedName name="_xlnm._FilterDatabase" localSheetId="${i}" hidden="1">'${esc(s.name).replace(/'/g, "''")}'!${abs(s.filter)}</definedName>` : '').join('');
+    add('xl/workbook.xml', HEAD + `<workbook xmlns="${NS}" xmlns:r="${NSR}"><bookViews><workbookView activeTab="0"/></bookViews><sheets>`
+      + sheets.map((s, i) => `<sheet name="${esc(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('') + '</sheets>'
+      + (names ? `<definedNames>${names}</definedNames>` : '') + '<calcPr calcId="191029"/></workbook>');
+    add('xl/_rels/workbook.xml.rels', HEAD + `<Relationships xmlns="${NSP}">`
+      + sheets.map((s, i) => `<Relationship Id="rId${i + 1}" Type="${NSR}/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('')
+      + `<Relationship Id="rId${sheets.length + 1}" Type="${NSR}/styles" Target="styles.xml"/></Relationships>`);
+    add('xl/styles.xml', stylesXml());
+    sheets.forEach((s, i) => add(`xl/worksheets/sheet${i + 1}.xml`, sheetXml(s, i === 0)));
+    const out = XLSX.CFB.write(zip, { fileType: 'zip', type: 'array', compression: true });
+    return out instanceof Uint8Array ? out : new Uint8Array(out);
+  }
+
+  return { sheet, book };
+})();
+
+/* ------------------------------------------------------------ the monitoring workbook */
+function entryWorkbook(term, rows, when, who) {
+  const stamp = when.toLocaleString('en-PH', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+  const school = (S.settings && (S.settings.schoolFull || S.settings.schoolName)) || 'the school';
+  const sheets = [];
+  const mark = st => st === 'no' ? '✗' : '✓';
+
+  /* one tab per grade level */
+  [...new Set(rows.map(r => r.sec.grade))].sort((a, b) => a - b).forEach(g => {
+    const gr = rows.filter(r => r.sec.grade === g);
+    const secs = [...new Set(gr.map(r => r.sec))];
+    const areas = [...new Set(gr.map(r => r.a.subject + '|' + r.part))]
+      .sort((x, y) => entryAreaOrder(...x.split('|')) - entryAreaOrder(...y.split('|')));
+    const sh = XW.sheet('Grade ' + g);
+    sh.set(0, 0, `Learning area\n(Term ${term})`, 'head').set(1, 0, '', 'head').merge(0, 0, 1, 0);
+    const f1 = 2 + areas.length, f2 = f1 + 1;
+    areas.forEach((ak, ai) => { const [code, p] = ak.split('|'); sh.set(2 + ai, 0, entryArea(code, p), 'area'); sh.height(2 + ai, 28); });
+    sh.set(f1, 0, 'Learning areas with entries (✓)', 'footLabel').height(f1, 28);
+    sh.set(f2, 0, 'Learning areas without entries (✗)', 'footLabel').height(f2, 28);
+    secs.forEach((sec, si) => {
+      const c0 = 1 + si * 3;
+      sh.set(0, c0, sec.label, 'head').set(0, c0 + 1, '', 'head').set(0, c0 + 2, '', 'head').merge(0, c0, 0, c0 + 2);
+      ['Teacher', 'WW', 'PT'].forEach((t, k) => sh.set(1, c0 + k, t, 'sub'));
+      const tally = { w: [0, 0], p: [0, 0] };
+      areas.forEach((ak, ai) => {
+        const r = gr.find(x => x.sec === sec && x.a.subject + '|' + x.part === ak);
+        if (!r) { [0, 1, 2].forEach(k => sh.set(2 + ai, c0 + k, '—', 'none')); return; }
+        const w = entryState(r.ww, r.n), p = entryState(r.pt, r.n);
+        sh.set(2 + ai, c0, r.a.teacher, 'teacher').set(2 + ai, c0 + 1, mark(w), w).set(2 + ai, c0 + 2, mark(p), p);
+        tally.w[w === 'no' ? 1 : 0]++; tally.p[p === 'no' ? 1 : 0]++;
+      });
+      sh.set(f1, c0, '', 'footBlank').set(f1, c0 + 1, tally.w[0], 'footNum').set(f1, c0 + 2, tally.p[0], 'footNum');
+      sh.set(f2, c0, '', 'footBlank').set(f2, c0 + 1, tally.w[1], 'footNum').set(f2, c0 + 2, tally.p[1], 'footNum');
+      sh.width(c0, 21); sh.width(c0 + 1, 5.5); sh.width(c0 + 2, 5.5);
+    });
+    const legend = [
+      ['How to read this sheet', 'bold'],
+      [`✓  At least one learner has a score in that component for Term ${term} (WW = Written Work, PT = Performance Task).`, 'plain'],
+      ['✓ in amber  Started, but fewer than half of the learners on the roster have a score in it yet.', 'plain'],
+      ['✗  No learner has a score in it yet. A highest possible score typed in with no learner scores still counts as ✗.', 'plain'],
+      ['—  No subject teacher is assigned to this learning area in this section.', 'plain'],
+      ['MAPEH is checked separately for Music & Arts and for PE & Health. Learner counts and when each class record was last saved are on the Details tab.', 'plain'],
+      [`From the ${school} class records on ${stamp}${who ? ', downloaded by ' + who : ''}. It shows the class records as they were at that moment.`, 'small']
+    ];
+    legend.forEach((l, i) => sh.set(f2 + 2 + i, 0, l[0], l[1]));
+    sh.width(0, 24); sh.height(0, 30); sh.height(1, 18);
+    sh.freeze = { r: 2, c: 1 };
+    sheets.push(sh);
+  });
+
+  /* teachers */
+  const tl = entryTeachers(rows);
+  const t = XW.sheet('Teachers');
+  t.set(0, 0, `Term ${term}: teachers with and without Written Work and Performance Task entries`, 'title');
+  t.set(1, 0, `As of ${stamp}. A class record is one learning area in one section; MAPEH counts Music & Arts and PE & Health separately.`, 'small');
+  const cnt = s => tl.filter(x => x.status === s).length;
+  [['Teachers', tl.length], ['Have WW and PT in every class', cnt('Has WW & PT in every class')],
+    ['Missing WW or PT in some classes', cnt('Missing in some classes')], ['No WW or PT in any class yet', cnt('No WW or PT in any class')]]
+    .forEach((x, i) => t.set(3 + i, 0, x[0], 'bold').set(3 + i, 1, x[1], 'bold'));
+  const TH = 8;
+  ['Subject teacher', `Class records (Term ${term})`, 'With WW', 'Without WW', 'With PT', 'Without PT', 'Status', 'Where WW is missing', 'Where PT is missing']
+    .forEach((h, i) => t.set(TH, i, h, 'head'));
+  tl.forEach((x, i) => {
+    const r = TH + 1 + i;
+    t.set(r, 0, x.name, 'name').set(r, 1, x.total, 'num').set(r, 2, x.ww, 'num').set(r, 3, x.total - x.ww, x.total - x.ww ? 'numBad' : 'num')
+      .set(r, 4, x.pt, 'num').set(r, 5, x.total - x.pt, x.total - x.pt ? 'numBad' : 'num')
+      .set(r, 6, x.status, x.rank === 2 ? 'stGood' : x.rank === 0 ? 'stBad' : 'stPart')
+      .set(r, 7, x.wwMissing || '—', 'text').set(r, 8, x.ptMissing || '—', 'text');
+    /* Excel does not always grow a row to fit wrapped text, so size the long ones here (~58 characters a line) */
+    const lines = Math.ceil(Math.max(x.wwMissing.length, x.ptMissing.length) / 58);
+    if (lines > 1) t.height(r, lines * 12.75 + 3);
+  });
+  [30, 12, 9, 10, 9, 10, 26, 55, 55].forEach((w, i) => t.width(i, w));
+  t.height(TH, 32);
+  t.freeze = { r: TH + 1, c: 1 };
+  t.filter = `A${TH + 1}:I${TH + 1 + tl.length}`;
+  sheets.push(t);
+
+  /* details */
+  const d = XW.sheet('Details');
+  ['Grade', 'Section', 'Learning area', 'Subject teacher', 'Learners on roster', 'WW score columns used', 'Learners with WW scores',
+    'WW highest possible scores set', 'WW entry', 'PT score columns used', 'Learners with PT scores', 'PT highest possible scores set', 'PT entry',
+    'Last saved', 'Last saved by', 'Note'].forEach((h, i) => d.set(0, i, h, 'head'));
+  rows.forEach((r, i) => {
+    const w = entryState(r.ww, r.n), p = entryState(r.pt, r.n), notes = [];
+    [['WW', r.ww], ['PT', r.pt]].forEach(([k, c]) => {
+      if (!c.learners && c.hps) notes.push(k + ': highest possible score set, no learner scores yet');
+      if (c.learners && !c.hps) notes.push(k + ': scores entered but no highest possible score');
+      if (c.learners && r.n && c.learners < r.n / 2) notes.push(`${k}: only ${c.learners} of ${r.n} learners have scores`);
+    });
+    const saved = r.updatedAt ? new Date(r.updatedAt) : null;
+    const row = i + 1;
+    d.set(row, 0, r.sec.grade, 'num').set(row, 1, r.sec.label, 'text').set(row, 2, r.area, 'text').set(row, 3, r.a.teacher, 'text')
+      .set(row, 4, r.n, 'num').set(row, 5, r.ww.cols, 'num').set(row, 6, r.ww.learners, 'num').set(row, 7, r.ww.hps, 'num').set(row, 8, mark(w), w)
+      .set(row, 9, r.pt.cols, 'num').set(row, 10, r.pt.learners, 'num').set(row, 11, r.pt.hps, 'num').set(row, 12, mark(p), p)
+      .set(row, 13, saved && !isNaN(saved) ? saved : '', 'when').set(row, 14, r.updatedBy, 'text').set(row, 15, notes.join('; '), 'text');
+    const lines = Math.ceil(notes.join('; ').length / 66);
+    if (lines > 1) d.height(row, lines * 12.75 + 3);
+  });
+  [7, 18, 22, 30, 10, 10, 10, 11, 8, 10, 10, 11, 8, 20, 30, 60].forEach((w, i) => d.width(i, w));
+  d.height(0, 45);
+  d.freeze = { r: 1, c: 4 };
+  d.filter = `A1:P${rows.length + 1}`;
+  sheets.push(d);
+  return sheets;
+}
+
+function saveXlsxBytes(bytes, name) {
+  const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name.replace(/[\\/:*?"<>|]/g, '-');
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+
+async function runEntryExport() {
+  if (ENTRY.running) return;
+  const term = ENTRY.term || entryTermGuess();
+  ENTRY.running = true; ENTRY.msg = 'Reading the class records…'; drawEntryPanel();
+  try {
+    const got = await fetchEntryStatus(term, (done, n) => {
+      ENTRY.msg = `Opening the class records one by one: ${done} of ${n}…`; drawEntryPanel();
+    });
+    const when = new Date();
+    const rows = entryRows(term, got.records);
+    const who = S.user ? (S.user.name || S.user.email || '') : '';
+    const pad = n => String(n).padStart(2, '0');
+    const stamp = `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}${pad(when.getMinutes())}`;
+    saveXlsxBytes(XW.book(entryWorkbook(term, rows, when, who)), `WW-PT Entries Term ${term} (${stamp}).xlsx`);
+    const tl = entryTeachers(rows);
+    const all = tl.filter(x => x.rank === 2).length, none = tl.filter(x => x.rank === 0).length;
+    ENTRY.msg = `Downloaded at ${when.toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' })}. Term ${term}: ${all} of ${tl.length} teachers have WW and PT in every class; ${none} have none yet.`
+      + (!got.fast && S.user && S.user.admin ? ' To make this take seconds instead of minutes, update the server code (Settings → Download server code) and deploy it as a new version.' : '');
+  } catch (e) {
+    ENTRY.msg = '';
+    if (e.code !== 'auth') toast(e.message || 'The workbook could not be made.', true);
+  } finally {
+    ENTRY.running = false; drawEntryPanel();
+  }
+}
+
+/* the panel on the dashboard; school heads and administrators only, since teachers see just their own classes */
+function entryPanelHtml() {
+  if (isTeacherOnly()) return '';
+  const term = ENTRY.term || entryTermGuess();
+  const msg = ENTRY.msg || 'One tab per grade level (sections across the top; teacher, WW and PT under each), plus a Teachers tab and the details. It shows the class records as they are when you download it.';
+  return `<div class="panel" id="entryPanel">
+    <h3>WW &amp; PT entry monitoring <span class="sub">Which subject teachers have entered at least one Written Work and one Performance Task score</span></h3>
+    <div class="controls" style="border-bottom:0">
+      <div class="ctl"><label for="entryTerm">Term</label><select id="entryTerm"${ENTRY.running ? ' disabled' : ''}>${TERMS.map(t => `<option value="${t}"${t === term ? ' selected' : ''}>Term ${t}</option>`).join('')}</select></div>
+      <div class="ctl" style="min-width:0"><label>&nbsp;</label><button class="btn" id="entryGo"${ENTRY.running ? ' disabled' : ''}>${ENTRY.running ? 'Preparing…' : 'Download Excel'}</button></div>
+      <p class="hint" id="entryMsg" style="flex-basis:100%;margin:0" aria-live="polite">${esc(msg)}</p>
+    </div></div>`;
+}
+function bindEntryPanel() {
+  const sel = $('#entryTerm'), btn = $('#entryGo');
+  if (sel) sel.onchange = e => { ENTRY.term = Number(e.target.value); ENTRY.msg = ''; drawEntryPanel(); };
+  if (btn) btn.onclick = runEntryExport;
+}
+function drawEntryPanel() {
+  const el = $('#entryPanel');
+  if (!el) return;
+  el.outerHTML = entryPanelHtml();
+  bindEntryPanel();
+}
+</script>
+<script>
+/* ====================================================================
    Proficiency Level and Class Records — application
    ==================================================================== */
 
@@ -6918,6 +7363,8 @@ function drawDash() {
       </div>
     </div>
 
+    ${entryPanelHtml()}
+
     <div class="panel">
       <h3>Sections by learning area <span class="sub">${termLabel} · ${metricHelp}</span><span class="spacer"></span>
         ${seg('metric', [['pass', 'Passing'], ['adv', 'Advancing'], ['mean', 'Mean']])}</h3>
@@ -6935,6 +7382,7 @@ function drawDash() {
     <div class="plegend">${scale.map((b, i) => `<span><i class="p${i}"></i>${b.label} (${b.range})</span>`).join('')}</div>
   </div>`;
   $('#dashGrade').onchange = e => { DASH.grade = e.target.value; drawDash(); };
+  bindEntryPanel();
 }
 
 /* ------------------------------------------------------------ records list */
